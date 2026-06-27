@@ -315,3 +315,38 @@ def test_accepts_require_encryption_with_key(tmp_path: Path) -> None:
     )
     r = _esphome_config(_wrap(body), tmp_path)
     assert "Configuration is valid" in (r.stdout + r.stderr), r.stdout + r.stderr
+
+
+def test_rejects_replay_window_without_time(tmp_path: Path) -> None:
+    """replay_window needs a time source to clock freshness against."""
+    body = textwrap.dedent(
+        """\
+        mpubsub:
+          encryption:
+            key: "passphrase"
+            replay_window: 30s
+        """
+    )
+    r = _esphome_config(_wrap(body), tmp_path)
+    assert r.returncode != 0
+    assert "replay_window" in (r.stdout + r.stderr)
+
+
+def test_accepts_replay_window_with_time(tmp_path: Path) -> None:
+    # homeassistant time validates on the host platform (sntp doesn't); it
+    # needs api:, which host supports.
+    body = textwrap.dedent(
+        """\
+        api:
+        time:
+          - platform: homeassistant
+            id: ha_time
+        mpubsub:
+          encryption:
+            key: "passphrase"
+            replay_window: 30s
+            time_id: ha_time
+        """
+    )
+    r = _esphome_config(_wrap(body), tmp_path)
+    assert "Configuration is valid" in (r.stdout + r.stderr), r.stdout + r.stderr

@@ -414,7 +414,7 @@ def _do_listen(args, group, schemas) -> int:
         except socket.timeout:
             return 0
         try:
-            crc, encoding, payload = decode_envelope(data)
+            crc, encoding, payload, *_ = decode_envelope(data)
         except WireError as e:
             print(f"[bad packet from {peer}]: {e}")
             continue

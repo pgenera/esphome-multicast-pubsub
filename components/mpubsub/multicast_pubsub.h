@@ -28,6 +28,11 @@ struct pbuf;
 
 #include "topic_hash.h"
 #include "wire_format.h"
+#include "replay_guard.h"
+
+#ifdef USE_TIME
+#include "esphome/components/time/real_time_clock.h"
+#endif
 
 namespace esphome::multicast_pubsub {
 
@@ -95,6 +100,17 @@ class MulticastPubSub : public Component {
         this->encryption_key_bytes_[i] = key[i];
     }
   }
+
+  // Enable replay protection (Option B). Each encrypted publish() is stamped
+  // with the wall clock + a random nonce inside the ciphertext; on receive,
+  // encrypted packets that are stale or duplicate within `window_seconds`
+  // are dropped (see replay_guard.h). 0 (the default) leaves it off.
+  // Needs a synchronized time source (set_time); without one the receiver
+  // fails closed and drops every encrypted packet while protection is on.
+  void set_replay_window(uint32_t window_seconds) { this->replay_guard_.set_window(window_seconds); }
+#ifdef USE_TIME
+  void set_time(time::RealTimeClock *clock) { this->clock_ = clock; }
+#endif
 
   void setup() override;
   void loop() override;
@@ -182,6 +198,41 @@ class MulticastPubSub : public Component {
 
  protected:
   void deliver_(uint32_t crc, Encoding encoding, std::span<const uint8_t> payload, bool was_encrypted);
+  // Fill `body` (length body_len, a multiple of 4) with the XXTEA plaintext
+  // -- [crc || timestamp || nonce] prefix + payload + zero pad -- and encrypt
+  // it in place. Shared by both platform publish() paths.
+  void encrypt_body_(uint8_t *body, size_t body_len, uint32_t crc, std::span<const uint8_t> payload);
+  // Decrypt an EncMode::XXTEA packet, run the replay check, and dispatch.
+  // Shared by both platform on_packet_() paths.
+  void handle_encrypted_(const DecodedPacket &pkt);
+  // Current wall-clock unix time for stamping an outgoing publish. Returns 0
+  // when no synchronized clock is available; a replay-checking receiver
+  // treats 0 as "unverifiable" and drops it.
+  uint32_t replay_timestamp_() const {
+#ifdef USE_TIME
+    if (this->clock_ != nullptr) {
+      auto t = this->clock_->now();
+      if (t.is_valid())
+        return static_cast<uint32_t>(t.timestamp);
+    }
+#endif
+    return 0;
+  }
+  // Receiver-side current time. Writes `*now` and returns whether the local
+  // clock has synced (false => replay guard fails closed).
+  bool replay_now_(uint32_t *now) const {
+#ifdef USE_TIME
+    if (this->clock_ != nullptr) {
+      auto t = this->clock_->now();
+      if (t.is_valid()) {
+        *now = static_cast<uint32_t>(t.timestamp);
+        return true;
+      }
+    }
+#endif
+    *now = 0;
+    return false;
+  }
   Subscription *find_subscription_(const std::string &topic);
   // Look up `topic` -- create + join the multicast group if missing.
   // Used by both raw subscribe() and typed subscribe_typed<T>(). The
@@ -238,6 +289,14 @@ class MulticastPubSub : public Component {
   // which makes the SHA-256 digest interpretation portable across hosts
   // (both x86 and Xtensa are little-endian, so the word view agrees).
   alignas(uint32_t) uint8_t encryption_key_bytes_[32]{};
+
+  // Replay protection (Option B). The guard is inert until set_replay_window
+  // configures a non-zero window. clock_ supplies the freshness reference on
+  // both the send (stamp) and receive (check) sides.
+  ReplayGuard replay_guard_{};
+#ifdef USE_TIME
+  time::RealTimeClock *clock_{nullptr};
+#endif
 
 #ifdef USE_ESP8266
   struct udp_pcb *pcb_{nullptr};

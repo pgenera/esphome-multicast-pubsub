@@ -16,13 +16,19 @@
 // Byte 10 (ENC_MODE) signals whether the body is encrypted:
 //   0x00 = NONE  -- plaintext (default; bytes 4-7 carry the topic CRC and
 //                    PAY_LEN equals the on-wire body length).
-//   0x01 = XXTEA -- the body is XXTEA-256 ciphertext over
-//                    [TOPIC_CRC32 LE (4 bytes) || plaintext payload],
-//                    zero-padded up to max(8, roundup4(4 + PAY_LEN)) bytes
-//                    (XXTEA needs n>=2 32-bit words). PAY_LEN stays the
-//                    plaintext payload length; bytes 4-7 are written as
-//                    zero by the sender and ignored on receive (the real
-//                    CRC32 lives at the start of the decrypted plaintext).
+//   0x01 = XXTEA -- the body is XXTEA-256 ciphertext over a 12-byte prefix
+//                    followed by the plaintext payload:
+//                      [TOPIC_CRC32 LE (4)][TIMESTAMP LE (4)][NONCE LE (4)]
+//                      || payload
+//                    zero-padded up to roundup4(12 + PAY_LEN) bytes (the
+//                    12-byte prefix already clears XXTEA's 2-word minimum).
+//                    TIMESTAMP is unix epoch seconds (0 = sender had no
+//                    synced clock); NONCE is 4 random bytes per message.
+//                    Together they drive replay rejection (see replay_guard.h).
+//                    PAY_LEN stays the plaintext payload length; bytes 4-7
+//                    are written as zero by the sender and ignored on
+//                    receive (the real CRC32 lives at the start of the
+//                    decrypted plaintext).
 //   0x02..0xFF       -- reserved, receivers MUST drop.
 //
 // See ../../docs/PROTOCOL.md for the full specification and matching
@@ -66,15 +72,18 @@ constexpr bool is_known_enc_mode(uint8_t value) {
   return value == static_cast<uint8_t>(EncMode::NONE) || value == static_cast<uint8_t>(EncMode::XXTEA);
 }
 
+// Bytes prepended to the plaintext inside the XXTEA ciphertext, ahead of the
+// user payload: TOPIC_CRC32 (4) + TIMESTAMP (4) + NONCE (4). The CRC is the
+// integrity tag; the timestamp + nonce feed receiver-side replay rejection.
+constexpr size_t XXTEA_PREFIX_LEN = 12;
+
 // Ciphertext length for a plaintext payload of `payload_len` bytes under
-// EncMode::XXTEA. Equals max(8, roundup4(4 + payload_len)): we prepend a
-// 4-byte CRC32 to the plaintext, then zero-pad up to a multiple of 4 bytes
-// (XXTEA word size), with an 8-byte floor (XXTEA requires n>=2 words).
+// EncMode::XXTEA. Equals roundup4(XXTEA_PREFIX_LEN + payload_len): the
+// 12-byte prefix plus the payload, zero-padded up to a multiple of 4 bytes
+// (XXTEA word size). The prefix alone already exceeds XXTEA's 2-word (8-byte)
+// minimum, so no separate floor is needed.
 constexpr size_t xxtea_ciphertext_len(size_t payload_len) {
-  size_t needed = payload_len + 4;
-  if (needed < 8)
-    return 8;
-  return (needed + 3) & ~size_t{3};
+  return (payload_len + XXTEA_PREFIX_LEN + 3) & ~size_t{3};
 }
 
 enum class DecodeError : uint8_t {

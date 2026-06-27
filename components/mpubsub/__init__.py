@@ -8,6 +8,7 @@ import hashlib
 from esphome import automation
 import esphome.codegen as cg
 from esphome.components import sensor as esphome_sensor
+from esphome.components import time
 import esphome.config_validation as cv
 from esphome.components.api import CONF_ENCRYPTION
 from esphome.const import (
@@ -21,6 +22,7 @@ from esphome.const import (
     CONF_PAYLOAD,
     CONF_PORT,
     CONF_STATE_CLASS,
+    CONF_TIME_ID,
     CONF_TOPIC,
     CONF_TRIGGER_ID,
     CONF_TYPE,
@@ -67,6 +69,7 @@ CONF_MESSAGE = "message"
 CONF_REPEATED = "repeated"
 CONF_VALUES = "values"
 CONF_REQUIRE_ENCRYPTION = "require_encryption"
+CONF_REPLAY_WINDOW = "replay_window"
 
 SCOPES = {
     "link-local": Scope.LINK_LOCAL,
@@ -272,6 +275,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ENCRYPTION): cv.Schema(
             {
                 cv.Required(CONF_KEY): cv.string_strict,
+                # Replay protection (Option B): stamp each encrypted publish
+                # with the wall clock + a random nonce and drop stale /
+                # duplicate packets within this freshness window on receive.
+                # Requires a `time:` source (time_id). Omit to leave it off.
+                cv.Optional(CONF_REPLAY_WINDOW): cv.positive_time_period_seconds,
+                cv.Optional(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
             }
         ),
         cv.Optional(CONF_MESSAGES, default=list): _messages_validator,
@@ -322,6 +331,19 @@ def _final_validate(config):
                 f"under `messages:`. Known: {sorted(declared) or '(none)'}",
                 path=[CONF_ON_MESSAGE, i, CONF_MESSAGE],
             )
+
+    # Replay protection needs a clock to measure freshness against: a
+    # replay_window without a time_id has nothing to check the timestamp
+    # against, so the receiver would fail closed and drop every packet.
+    enc = config.get(CONF_ENCRYPTION)
+    if enc and CONF_REPLAY_WINDOW in enc and CONF_TIME_ID not in enc:
+        raise cv.Invalid(
+            "encryption `replay_window` requires `time_id:` pointing at a "
+            "`time:` component (the receiver measures packet freshness "
+            "against the wall clock; without it every encrypted packet "
+            "would be dropped).",
+            path=[CONF_ENCRYPTION, CONF_REPLAY_WINDOW],
+        )
 
     # require_encryption on any subscription requires the parent mpubsub:
     # block to have configured an encryption key -- otherwise the receiver
@@ -392,10 +414,18 @@ async def to_code(config):
     cg.add(var.set_retransmit_delay_ms(config[CONF_RETRANSMIT_DELAY].total_milliseconds))
 
     if CONF_ENCRYPTION in config:
+        enc = config[CONF_ENCRYPTION]
         # Mirror packet_transport's hash_encryption_key(): SHA-256 the user
         # passphrase to a deterministic 32-byte XXTEA-256 key.
-        digest = list(hashlib.sha256(config[CONF_ENCRYPTION][CONF_KEY].encode()).digest())
+        digest = list(hashlib.sha256(enc[CONF_KEY].encode()).digest())
         cg.add(var.set_encryption_key(digest))
+        # Optional replay protection: wire up the freshness window and the
+        # time source the receiver clocks freshness against. Presence of
+        # time_id when replay_window is set is enforced in _final_validate.
+        if CONF_REPLAY_WINDOW in enc:
+            cg.add(var.set_replay_window(int(enc[CONF_REPLAY_WINDOW].total_seconds)))
+            time_var = await cg.get_variable(enc[CONF_TIME_ID])
+            cg.add(var.set_time(time_var))
 
     # Auto-create diagnostic sensors for messages sent / received. Picked
     # up automatically by anything that iterates registered sensors

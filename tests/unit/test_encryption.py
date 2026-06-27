@@ -51,14 +51,14 @@ def test_xxtea_wrong_key_does_not_recover() -> None:
 @pytest.mark.parametrize(
     "plaintext_len,expected",
     [
-        (0, 8),     # 0+4 < 8 floor -> 8
-        (1, 8),     # 1+4 = 5 < 8 -> 8
-        (3, 8),     # 3+4 = 7 < 8 -> 8
-        (4, 8),     # 4+4 = 8 -> 8
-        (5, 12),    # 5+4 = 9 -> 12
-        (8, 12),    # 8+4 = 12 -> 12
-        (9, 16),    # 9+4 = 13 -> 16
-        (100, 104), # 100+4 = 104 -> 104
+        (0, 12),    # 0+12 = 12 -> 12 (prefix is already >= XXTEA's 8-byte min)
+        (1, 16),    # 1+12 = 13 -> 16
+        (3, 16),    # 3+12 = 15 -> 16
+        (4, 16),    # 4+12 = 16 -> 16
+        (5, 20),    # 5+12 = 17 -> 20
+        (8, 20),    # 8+12 = 20 -> 20
+        (9, 24),    # 9+12 = 21 -> 24
+        (100, 112), # 100+12 = 112 -> 112
     ],
 )
 def test_xxtea_ciphertext_len(plaintext_len: int, expected: int) -> None:
@@ -72,7 +72,7 @@ def test_encrypted_roundtrip_raw() -> None:
     key = derive_key("hunter2")
     payload = b"hello world"
     pkt = encode("home/x", payload, encoding=ENCODING_RAW, key=key)
-    crc, encoding, body = decode(pkt, key=key)
+    crc, encoding, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("home/x")
     assert encoding == ENCODING_RAW
     assert body == payload
@@ -82,19 +82,20 @@ def test_encrypted_roundtrip_protobuf() -> None:
     key = derive_key("topsecret")
     payload = bytes.fromhex("0d0000a8410d0000484200000000")
     pkt = encode("topic/y", payload, encoding=ENCODING_PROTOBUF, key=key)
-    crc, encoding, body = decode(pkt, key=key)
+    crc, encoding, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("topic/y")
     assert encoding == ENCODING_PROTOBUF
     assert body == payload
 
 
 def test_encrypted_empty_payload() -> None:
-    """0-byte payloads still produce a valid 8-byte ciphertext (XXTEA floor)."""
+    """0-byte payloads still produce a valid 12-byte ciphertext (just the
+    crc/timestamp/nonce prefix, no padding needed)."""
     key = derive_key("k")
     pkt = encode("t", b"", key=key)
-    # 12-byte header + 8-byte minimum ciphertext = 20 bytes total
-    assert len(pkt) == HEADER_LEN + 8
-    crc, encoding, body = decode(pkt, key=key)
+    # 12-byte header + 12-byte prefix-only ciphertext = 24 bytes total
+    assert len(pkt) == HEADER_LEN + 12
+    crc, encoding, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("t")
     assert body == b""
 
@@ -118,7 +119,7 @@ def test_encrypted_enc_mode_byte_is_xxtea() -> None:
 
 def test_encrypted_pay_len_is_plaintext_length() -> None:
     key = derive_key("k")
-    payload = b"hello"  # 5 bytes -> 12-byte ciphertext
+    payload = b"hello"  # 5 bytes -> 20-byte ciphertext
     pkt = encode("t", payload, key=key)
     pay_len = int.from_bytes(pkt[8:10], "little")
     assert pay_len == len(payload)
@@ -133,7 +134,7 @@ def test_wrong_key_produces_wrong_crc() -> None:
     bad = derive_key("wrong")
     payload = b"sensitive"
     pkt = encode("home/x", payload, key=key)
-    crc, _, body = decode(pkt, key=bad)
+    crc, _, body, *_ = decode(pkt, key=bad)
     assert crc != topic_crc32("home/x")
     assert body != payload  # body is also garbage; receiver drops on CRC mismatch
 
@@ -163,18 +164,18 @@ def test_encrypted_length_mismatch_rejected() -> None:
 def test_max_payload_under_encryption() -> None:
     """Largest payload that still fits the 1232-byte datagram cap when encrypted."""
     key = derive_key("k")
-    # 4 (crc) + 1216 (payload) = 1220 -> roundup4 = 1220 -> fits exactly
-    pkt = encode("t", b"x" * 1216, key=key)
+    # 12 (crc+ts+nonce) + 1208 (payload) = 1220 -> roundup4 = 1220 -> fits exactly
+    pkt = encode("t", b"x" * 1208, key=key)
     assert len(pkt) == MAX_DATAGRAM
-    crc, _, body = decode(pkt, key=key)
+    crc, _, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("t")
-    assert body == b"x" * 1216
+    assert body == b"x" * 1208
 
 
 def test_oversize_encrypted_payload_rejected() -> None:
     key = derive_key("k")
     with pytest.raises(ValueError, match="encrypted payload too large"):
-        encode("t", b"x" * 1217, key=key)
+        encode("t", b"x" * 1209, key=key)
 
 
 def test_plaintext_decode_with_key_still_works() -> None:
@@ -185,7 +186,7 @@ def test_plaintext_decode_with_key_still_works() -> None:
     """
     key = derive_key("k")
     pkt = encode("t", b"plain", key=None)
-    crc, _, body = decode(pkt, key=key)
+    crc, _, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("t")
     assert body == b"plain"
 
@@ -198,3 +199,42 @@ def test_encrypted_packet_is_not_decodable_as_plaintext() -> None:
     # the packet as encrypted and refuses to silently return garbage.
     with pytest.raises(WireError):
         decode(pkt)
+
+
+# --- Replay fields (timestamp + nonce inside the ciphertext) -----------------
+
+
+def test_encrypted_timestamp_nonce_roundtrip() -> None:
+    key = derive_key("k")
+    pkt = encode("t", b"hi", key=key, timestamp=1_700_000_000, nonce=0xDEADBEEF)
+    msg = decode(pkt, key=key)
+    assert msg.was_encrypted
+    assert msg.timestamp == 1_700_000_000
+    assert msg.nonce == 0xDEADBEEF
+    assert msg.payload == b"hi"
+
+
+def test_default_nonce_makes_identical_payloads_distinct() -> None:
+    """Two publishes of the same value get different random nonces, so their
+    ciphertexts differ on the wire (and the de-dup cache won't collapse two
+    genuinely distinct messages)."""
+    key = derive_key("k")
+    a = encode("t", b"same", key=key, timestamp=1_700_000_000)
+    b = encode("t", b"same", key=key, timestamp=1_700_000_000)
+    assert a != b
+
+
+def test_retransmit_shares_nonce() -> None:
+    """A retransmit re-sends the identical pre-encoded datagram, so the nonce
+    is shared -- that is what lets the receiver collapse retransmits to one
+    delivery instead of treating each as a fresh message."""
+    key = derive_key("k")
+    pkt = encode("t", b"v", key=key, timestamp=1_700_000_000, nonce=0x11223344)
+    assert decode(pkt, key=key).nonce == decode(pkt, key=key).nonce == 0x11223344
+
+
+def test_plaintext_has_no_replay_fields() -> None:
+    msg = decode(encode("t", b"x"))
+    assert msg.timestamp is None
+    assert msg.nonce is None
+    assert not msg.was_encrypted

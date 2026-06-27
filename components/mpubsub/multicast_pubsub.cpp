@@ -14,6 +14,66 @@ namespace esphome::multicast_pubsub {
 
 static const char *const TAG = "mpubsub";
 
+// Build the XXTEA plaintext -- [crc || timestamp || nonce] prefix, then the
+// payload, then zero pad -- and encrypt it in place. Shared by both platform
+// publish() paths so the prefix layout lives in exactly one place.
+void MulticastPubSub::encrypt_body_(uint8_t *body, size_t body_len, uint32_t crc,
+                                    std::span<const uint8_t> payload) {
+  uint32_t ts = this->replay_timestamp_();
+  uint32_t nonce = random_uint32();
+  // 12-byte prefix, all little-endian: crc(4) | timestamp(4) | nonce(4).
+  body[0] = uint8_t(crc);
+  body[1] = uint8_t(crc >> 8);
+  body[2] = uint8_t(crc >> 16);
+  body[3] = uint8_t(crc >> 24);
+  body[4] = uint8_t(ts);
+  body[5] = uint8_t(ts >> 8);
+  body[6] = uint8_t(ts >> 16);
+  body[7] = uint8_t(ts >> 24);
+  body[8] = uint8_t(nonce);
+  body[9] = uint8_t(nonce >> 8);
+  body[10] = uint8_t(nonce >> 16);
+  body[11] = uint8_t(nonce >> 24);
+  std::memcpy(body + XXTEA_PREFIX_LEN, payload.data(), payload.size());
+  std::memset(body + XXTEA_PREFIX_LEN + payload.size(), 0, body_len - XXTEA_PREFIX_LEN - payload.size());
+  xxtea::encrypt(reinterpret_cast<uint32_t *>(body), body_len / 4,
+                 reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
+}
+
+// Decrypt an EncMode::XXTEA packet into a stack buffer, recover the
+// crc/timestamp/nonce prefix, run the replay check, and dispatch. The
+// decrypted span is only handed to deliver_(), which dispatches callbacks
+// synchronously, so the buffer's lifetime is sufficient.
+void MulticastPubSub::handle_encrypted_(const DecodedPacket &pkt) {
+  if (!this->encryption_enabled_) {
+    ESP_LOGV(TAG, "drop encrypted packet: this node has no encryption key");
+    return;
+  }
+  std::array<uint8_t, MAX_DATAGRAM> work;
+  size_t clen = pkt.payload.size();
+  if (clen > work.size()) {
+    ESP_LOGV(TAG, "drop encrypted packet: ciphertext %zu exceeds buffer", clen);
+    return;
+  }
+  std::memcpy(work.data(), pkt.payload.data(), clen);
+  xxtea::decrypt(reinterpret_cast<uint32_t *>(work.data()), clen / 4,
+                 reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
+  uint32_t crc = uint32_t(work[0]) | (uint32_t(work[1]) << 8) | (uint32_t(work[2]) << 16) | (uint32_t(work[3]) << 24);
+  uint32_t ts = uint32_t(work[4]) | (uint32_t(work[5]) << 8) | (uint32_t(work[6]) << 16) | (uint32_t(work[7]) << 24);
+  uint32_t nonce =
+      uint32_t(work[8]) | (uint32_t(work[9]) << 8) | (uint32_t(work[10]) << 16) | (uint32_t(work[11]) << 24);
+  if (this->replay_guard_.enabled()) {
+    uint32_t now = 0;
+    bool now_valid = this->replay_now_(&now);
+    if (!this->replay_guard_.accept(now, now_valid, ts, nonce)) {
+      ESP_LOGV(TAG, "drop encrypted packet: replay/stale (ts=%u nonce=%08x)", ts, nonce);
+      return;
+    }
+  }
+  std::span<const uint8_t> body(work.data() + XXTEA_PREFIX_LEN, pkt.plaintext_len);
+  this->deliver_(crc, pkt.encoding, body, /*was_encrypted=*/true);
+}
+
 }  // namespace esphome::multicast_pubsub
 
 // arduino-esp8266 ships precompiled lwip2 with LWIP_SOCKET=0, so
@@ -168,6 +228,9 @@ void MulticastPubSub::dump_config() {
                 this->port_, scope_name, this->hops_, rt_buf,
                 this->encryption_enabled_ ? "xxtea-256" : "none",
                 static_cast<unsigned>(this->subscriptions_.size()));
+  if (this->replay_guard_.enabled()) {
+    ESP_LOGCONFIG(TAG, "  Replay protection: on (window %us)", this->replay_guard_.window());
+  }
   for (const auto &sub : this->subscriptions_) {
     char addr_buf[64];
     group_to_string(sub.group, addr_buf, sizeof(addr_buf));
@@ -210,11 +273,11 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
     ESP_LOGW(TAG, "publish(%s): pcb not ready", topic.c_str());
     return false;
   }
-  // The encrypted body is roundup4(4 + payload.size()); the +4 is a CRC32
-  // prefix carried inside the ciphertext, so encrypted publishes are capped
-  // 4 bytes lower than plaintext ones (the up-to-3 bytes of XXTEA word
-  // padding still fit under the 1220-byte cap).
-  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - 4) : MAX_PAYLOAD;
+  // The encrypted body is roundup4(12 + payload.size()); the +12 is the
+  // [crc || timestamp || nonce] prefix carried inside the ciphertext, so
+  // encrypted publishes are capped 12 bytes lower than plaintext ones (the
+  // up-to-3 bytes of XXTEA word padding still fit under the 1220-byte cap).
+  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - XXTEA_PREFIX_LEN) : MAX_PAYLOAD;
   if (payload.size() > effective_max) {
     ESP_LOGE(TAG, "publish('%s') rejected: payload %zu bytes exceeds max %zu (datagram limit %zu - 12-byte header)",
              topic.c_str(), payload.size(), effective_max, MAX_DATAGRAM);
@@ -234,14 +297,7 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
   encode_header(crc, encoding, static_cast<uint16_t>(payload.size()), datagram->data(), mode);
   uint8_t *body = datagram->data() + HEADER_LEN;
   if (mode == EncMode::XXTEA) {
-    body[0] = uint8_t(crc);
-    body[1] = uint8_t(crc >> 8);
-    body[2] = uint8_t(crc >> 16);
-    body[3] = uint8_t(crc >> 24);
-    std::memcpy(body + 4, payload.data(), payload.size());
-    std::memset(body + 4 + payload.size(), 0, body_len - 4 - payload.size());
-    xxtea::encrypt(reinterpret_cast<uint32_t *>(body), body_len / 4,
-                   reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
+    this->encrypt_body_(body, body_len, crc, payload);
   } else {
     std::memcpy(body, payload.data(), payload.size());
   }
@@ -306,25 +362,7 @@ void MulticastPubSub::on_packet_(std::span<const uint8_t> raw) {
     return;
   }
   if (pkt.enc_mode == EncMode::XXTEA) {
-    if (!this->encryption_enabled_) {
-      ESP_LOGV(TAG, "drop encrypted packet: this node has no encryption key");
-      return;
-    }
-    // In-place decrypt into a stack-local buffer; the decrypted span is
-    // only handed to deliver_(), which dispatches callbacks synchronously,
-    // so the buffer's lifetime is sufficient.
-    std::array<uint8_t, MAX_DATAGRAM> work;
-    size_t clen = pkt.payload.size();
-    if (clen > work.size()) {
-      ESP_LOGV(TAG, "drop encrypted packet: ciphertext %zu exceeds buffer", clen);
-      return;
-    }
-    std::memcpy(work.data(), pkt.payload.data(), clen);
-    xxtea::decrypt(reinterpret_cast<uint32_t *>(work.data()), clen / 4,
-                   reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
-    uint32_t crc = uint32_t(work[0]) | (uint32_t(work[1]) << 8) | (uint32_t(work[2]) << 16) | (uint32_t(work[3]) << 24);
-    std::span<const uint8_t> body(work.data() + 4, pkt.plaintext_len);
-    this->deliver_(crc, pkt.encoding, body, /*was_encrypted=*/true);
+    this->handle_encrypted_(pkt);
     return;
   }
   this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false);
@@ -564,6 +602,9 @@ void MulticastPubSub::dump_config() {
                 this->port_, scope_name, this->hops_, rt_buf,
                 this->encryption_enabled_ ? "xxtea-256" : "none",
                 static_cast<unsigned>(this->subscriptions_.size()));
+  if (this->replay_guard_.enabled()) {
+    ESP_LOGCONFIG(TAG, "  Replay protection: on (window %us)", this->replay_guard_.window());
+  }
   for (const auto &sub : this->subscriptions_) {
     char addr_buf[64];
     group_to_string(sub.group, addr_buf, sizeof(addr_buf));
@@ -616,11 +657,11 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
     ESP_LOGW(TAG, "publish(%s): socket not ready", topic.c_str());
     return false;
   }
-  // The encrypted body is roundup4(4 + payload.size()); the +4 is a CRC32
-  // prefix carried inside the ciphertext, so encrypted publishes are capped
-  // 4 bytes lower than plaintext ones (the up-to-3 bytes of XXTEA word
-  // padding still fit under the 1220-byte cap).
-  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - 4) : MAX_PAYLOAD;
+  // The encrypted body is roundup4(12 + payload.size()); the +12 is the
+  // [crc || timestamp || nonce] prefix carried inside the ciphertext, so
+  // encrypted publishes are capped 12 bytes lower than plaintext ones (the
+  // up-to-3 bytes of XXTEA word padding still fit under the 1220-byte cap).
+  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - XXTEA_PREFIX_LEN) : MAX_PAYLOAD;
   if (payload.size() > effective_max) {
     ESP_LOGE(TAG, "publish('%s') rejected: payload %zu bytes exceeds max %zu (datagram limit %zu - 12-byte header)",
              topic.c_str(), payload.size(), effective_max, MAX_DATAGRAM);
@@ -636,14 +677,7 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
   encode_header(crc, encoding, static_cast<uint16_t>(payload.size()), datagram->data(), mode);
   uint8_t *body = datagram->data() + HEADER_LEN;
   if (mode == EncMode::XXTEA) {
-    body[0] = uint8_t(crc);
-    body[1] = uint8_t(crc >> 8);
-    body[2] = uint8_t(crc >> 16);
-    body[3] = uint8_t(crc >> 24);
-    std::memcpy(body + 4, payload.data(), payload.size());
-    std::memset(body + 4 + payload.size(), 0, body_len - 4 - payload.size());
-    xxtea::encrypt(reinterpret_cast<uint32_t *>(body), body_len / 4,
-                   reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
+    this->encrypt_body_(body, body_len, crc, payload);
   } else {
     std::memcpy(body, payload.data(), payload.size());
   }

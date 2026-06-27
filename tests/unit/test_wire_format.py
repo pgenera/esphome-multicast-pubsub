@@ -39,7 +39,7 @@ def test_header_layout() -> None:
 def test_roundtrip_raw() -> None:
     payload = b"\x01\x02\x03\xff\xfe"
     pkt = encode("topic/x", payload, encoding=ENCODING_RAW)
-    crc, encoding, body = decode(pkt)
+    crc, encoding, body, *_ = decode(pkt)
     assert crc == topic_crc32("topic/x")
     assert encoding == ENCODING_RAW
     assert body == payload
@@ -50,7 +50,7 @@ def test_roundtrip_protobuf() -> None:
     # 12-byte header. Real protobuf decode happens in a higher layer.
     payload = bytes.fromhex("0d0000a8410d0000484200000000")
     pkt = encode("topic/y", payload, encoding=ENCODING_PROTOBUF)
-    crc, encoding, body = decode(pkt)
+    crc, encoding, body, *_ = decode(pkt)
     assert crc == topic_crc32("topic/y")
     assert encoding == ENCODING_PROTOBUF
     assert body == payload
@@ -115,7 +115,7 @@ def test_reserved_byte_11_ignored_on_decode() -> None:
     # Byte 10 is now ENC_MODE (no longer fully reserved); byte 11 still is.
     pkt = bytearray(encode("t", b"hi"))
     pkt[11] = 0xCD
-    crc, encoding, body = decode(bytes(pkt))
+    crc, encoding, body, *_ = decode(bytes(pkt))
     assert body == b"hi"
     assert encoding == ENCODING_RAW
 

@@ -9,7 +9,8 @@ SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
 COMP := ../../components/mpubsub
 
 .PHONY: all clean
-all: topic_hash_test wire_format_test wire_format_test_san topic_hash_test_san
+all: topic_hash_test wire_format_test wire_format_test_san topic_hash_test_san \
+     replay_guard_test replay_guard_test_san
 
 # DynamicMessage / DynamicReader are exercised end-to-end via the host
 # integration build (tests/typed_publisher.yaml's dynamic-publish lambda)
@@ -32,5 +33,13 @@ topic_hash_test_san: topic_hash_main.cpp $(COMP)/topic_hash.cpp $(COMP)/topic_ha
 wire_format_test_san: wire_format_main.cpp $(COMP)/wire_format.cpp $(COMP)/wire_format.h
 	$(CXX) $(CXXFLAGS) $(SAN_FLAGS) -I$(COMP) -o $@ wire_format_main.cpp $(COMP)/wire_format.cpp
 
+# ReplayGuard is header-only (no .cpp), so the harness pulls in just the header.
+replay_guard_test: replay_guard_main.cpp $(COMP)/replay_guard.h
+	$(CXX) $(CXXFLAGS) -I$(COMP) -o $@ replay_guard_main.cpp
+
+replay_guard_test_san: replay_guard_main.cpp $(COMP)/replay_guard.h
+	$(CXX) $(CXXFLAGS) $(SAN_FLAGS) -I$(COMP) -o $@ replay_guard_main.cpp
+
 clean:
-	rm -f topic_hash_test wire_format_test topic_hash_test_san wire_format_test_san
+	rm -f topic_hash_test wire_format_test topic_hash_test_san wire_format_test_san \
+	      replay_guard_test replay_guard_test_san

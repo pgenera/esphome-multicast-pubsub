@@ -7,7 +7,7 @@ import (
 )
 
 func TestEncodeDecodePlaintextRoundtrip(t *testing.T) {
-	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, nil)
+	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, nil, 0, 0)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestEncodeDecodePlaintextRoundtrip(t *testing.T) {
 func TestEncodeDecodeEncryptedRoundtrip(t *testing.T) {
 	key := DeriveKey("hunter2")
 	payload := []byte("secret message")
-	pkt, err := EncodePacket("home/x", payload, encodingRaw, key)
+	pkt, err := EncodePacket("home/x", payload, encodingRaw, key, 1_700_000_000, 0xDEADBEEF)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -54,12 +54,16 @@ func TestEncodeDecodeEncryptedRoundtrip(t *testing.T) {
 	if !d.WasEncrypted {
 		t.Errorf("WasEncrypted should be true")
 	}
+	// The replay fields survive the ciphertext roundtrip.
+	if d.Timestamp != 1_700_000_000 || d.Nonce != 0xDEADBEEF {
+		t.Errorf("replay fields mismatch: ts=%d nonce=%08x", d.Timestamp, d.Nonce)
+	}
 }
 
 func TestEncryptedWrongKeyDoesNotRecoverCRC(t *testing.T) {
 	key := DeriveKey("right")
 	bad := DeriveKey("wrong")
-	pkt, err := EncodePacket("home/x", []byte("payload"), encodingRaw, key)
+	pkt, err := EncodePacket("home/x", []byte("payload"), encodingRaw, key, 1_700_000_000, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +78,7 @@ func TestEncryptedWrongKeyDoesNotRecoverCRC(t *testing.T) {
 
 func TestEncryptedNoKeyRejected(t *testing.T) {
 	key := DeriveKey("k")
-	pkt, _ := EncodePacket("t", []byte("x"), encodingRaw, key)
+	pkt, _ := EncodePacket("t", []byte("x"), encodingRaw, key, 1_700_000_000, 1)
 	if _, err := DecodePacket(pkt, nil); err == nil {
 		t.Error("expected error decoding encrypted packet without key")
 	}
@@ -82,13 +86,13 @@ func TestEncryptedNoKeyRejected(t *testing.T) {
 
 func TestEncryptedEmptyPayload(t *testing.T) {
 	key := DeriveKey("k")
-	pkt, err := EncodePacket("t", nil, encodingRaw, key)
+	pkt, err := EncodePacket("t", nil, encodingRaw, key, 1_700_000_000, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 12 header + 8 min ciphertext = 20.
-	if len(pkt) != 20 {
-		t.Errorf("len = %d, want 20", len(pkt))
+	// 12 header + 12 prefix-only ciphertext (crc+ts+nonce, no payload) = 24.
+	if len(pkt) != 24 {
+		t.Errorf("len = %d, want 24", len(pkt))
 	}
 	d, err := DecodePacket(pkt, key)
 	if err != nil {
@@ -100,7 +104,7 @@ func TestEncryptedEmptyPayload(t *testing.T) {
 }
 
 func TestUnknownEncModeRejected(t *testing.T) {
-	pkt, _ := EncodePacket("t", nil, encodingRaw, nil)
+	pkt, _ := EncodePacket("t", nil, encodingRaw, nil, 0, 0)
 	pkt[10] = 0x7F
 	if _, err := DecodePacket(pkt, nil); err == nil {
 		t.Error("expected error on unknown enc_mode")
@@ -112,9 +116,12 @@ func TestUnknownEncModeRejected(t *testing.T) {
 // Go encoding. Locks the Go XXTEA and packet layout to the Python wire
 // reference (which is the source of truth that C++ also matches).
 func TestEncryptedKnownVectorMatchesPythonReference(t *testing.T) {
-	expected, _ := hex.DecodeString("4d50010000000000050001006f76d17350652a7aa67dd05c")
+	// Pinned with a fixed timestamp + nonce so the ciphertext is deterministic.
+	// Regenerate via tests/unit/reference.py encode(..., timestamp=1700000000,
+	// nonce=0xDEADBEEF) if the wire layout ever changes.
+	expected, _ := hex.DecodeString("4d5001000000000005000100a53deab5b768470c96f9adaf39cedcdd10b98296")
 	key := DeriveKey("hunter2")
-	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, key)
+	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, key, 1_700_000_000, 0xDEADBEEF)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +134,7 @@ func TestXXTEACiphertextLen(t *testing.T) {
 	cases := []struct {
 		in, out int
 	}{
-		{0, 8}, {1, 8}, {3, 8}, {4, 8}, {5, 12}, {8, 12}, {9, 16}, {100, 104},
+		{0, 12}, {1, 16}, {3, 16}, {4, 16}, {5, 20}, {8, 20}, {9, 24}, {100, 112},
 	}
 	for _, c := range cases {
 		if got := XXTEACiphertextLen(c.in); got != c.out {

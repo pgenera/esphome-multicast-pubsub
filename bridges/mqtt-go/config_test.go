@@ -79,6 +79,37 @@ func TestRequireEncryptionNeedsKey(t *testing.T) {
 	}
 }
 
+func TestReplayWindowParsed(t *testing.T) {
+	c := minimalConfig()
+	c.MPubsub.Encryption.Key = "passphrase"
+	c.MPubsub.Encryption.ReplayWindow = "45s"
+	if err := mustValidate(t, c); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.MPubsub.ReplayWindowSeconds != 45 {
+		t.Errorf("ReplayWindowSeconds = %d, want 45", c.MPubsub.ReplayWindowSeconds)
+	}
+}
+
+func TestReplayWindowNeedsKey(t *testing.T) {
+	c := minimalConfig()
+	c.MPubsub.Encryption.ReplayWindow = "30s"
+	err := mustValidate(t, c)
+	if err == nil || !strings.Contains(err.Error(), "encryption.key") {
+		t.Errorf("expected encryption.key requirement, got %v", err)
+	}
+}
+
+func TestReplayWindowRejectsBadDuration(t *testing.T) {
+	c := minimalConfig()
+	c.MPubsub.Encryption.Key = "passphrase"
+	c.MPubsub.Encryption.ReplayWindow = "nonsense"
+	err := mustValidate(t, c)
+	if err == nil || !strings.Contains(err.Error(), "replay_window") {
+		t.Errorf("expected replay_window parse error, got %v", err)
+	}
+}
+
 func TestRequireEncryptionWrongDirectionRejected(t *testing.T) {
 	c := minimalConfig()
 	c.MPubsub.Encryption.Key = "passphrase"

@@ -174,8 +174,19 @@ Byte 10 is a 1-byte enum signalling whether the body has been encrypted:
 | Value      | Name     | Body layout                                                       |
 |-----------:|----------|-------------------------------------------------------------------|
 | `0x00`     | `NONE`   | Plaintext (default; the body is exactly the §3.1 layout).         |
-| `0x01`     | `XXTEA`  | XXTEA-256 ciphertext over `[TOPIC_CRC32 LE (4 bytes)] || plaintext payload`, zero-padded up to `max(8, roundup4(4 + PAYLOAD_LEN))` bytes (XXTEA requires n ≥ 2 32-bit words). |
+| `0x01`     | `XXTEA`  | XXTEA-256 ciphertext over a 12-byte prefix followed by the plaintext payload: `[TOPIC_CRC32 LE (4)] || [TIMESTAMP LE (4)] || [NONCE LE (4)] || payload`, zero-padded up to `roundup4(12 + PAYLOAD_LEN)` bytes. The 12-byte prefix already exceeds XXTEA's 2-word (8-byte) minimum, so no separate floor is needed. |
 | `0x02..FF` | reserved | Receivers MUST drop.                                              |
+
+The prefix carries three fields ahead of the user payload:
+
+* **`TOPIC_CRC32`** — the integrity tag (see "Integrity check" below).
+* **`TIMESTAMP`** — unix epoch seconds at send time, or `0` if the sender
+  has no synchronized clock. Drives the receiver's freshness check.
+* **`NONCE`** — 4 random bytes per message. Gives every publication a
+  distinct identity even when two payloads are byte-identical, and is the
+  key the receiver de-duplicates on. A retransmit (`retransmit_count > 1`)
+  re-sends the same datagram and so reuses its nonce, which lets the
+  receiver collapse retransmits to a single delivery.
 
 **Key derivation.** The 32-byte XXTEA-256 key is `SHA-256(passphrase)`,
 identical to the convention `packet_transport` uses for its
@@ -208,21 +219,53 @@ encryption-only mode by setting `require_encryption: true` on an
 datagrams for that topic are then dropped at dispatch regardless of what
 other subscribers want.
 
-**Security caveats.** This scheme provides **confidentiality and weak
-integrity** within the threat model of "passive eavesdroppers and
-unkeyed attackers". It does **not** provide:
+**Replay protection (optional).** A captured XXTEA datagram is byte-identical
+however long after it was recorded, so anyone off the L2 segment can resend
+it. Enabling a freshness window turns the in-ciphertext `TIMESTAMP` + `NONCE`
+into replay rejection, with **no persistent state and no inter-node
+coordination** — the only shared reference is the externally-synced wall
+clock, which a node re-fetches over NTP/Home-Assistant time within seconds of
+every boot:
+
+```yaml
+mpubsub:
+  encryption:
+    key: "any-length passphrase"
+    replay_window: 30s     # enables replay protection
+    time_id: my_time       # a time: component to clock freshness against
+```
+
+The receiver applies two layers:
+
+1. **Freshness window.** Drop any packet whose `TIMESTAMP` is more than
+   `replay_window` seconds from the receiver's own clock. The timestamp lives
+   inside the ciphertext, so an attacker without the key cannot move it
+   without breaking the CRC — they can only resend a verbatim copy, which the
+   window confines to a short tail.
+2. **Nonce de-duplication.** Within that window the receiver remembers the
+   nonces it has recently seen (a bounded ring, so RAM stays fixed on
+   ESP8266-class devices) and drops repeats.
+
+The guard **fails closed**: while protection is on, a packet with
+`TIMESTAMP == 0` (the sender had no synced clock) or a receiver whose own
+clock has not yet synced is rejected, never silently admitted. The cache may
+be empty after a reboot — harmless, because layer 1 already rejects anything
+older than the window. This defends against any attacker **without** the key;
+a key-holder can still mint fresh packets, which replay protection alone
+cannot stop (see authentication, below).
+
+**Security caveats.** Even with replay protection on, this scheme provides
+**confidentiality and weak integrity** within the threat model of "passive
+eavesdroppers and unkeyed attackers". It does **not** provide:
 
 * **Forward secrecy** — the key is long-lived; capture-now-decrypt-later
   is feasible if the passphrase later leaks.
-* **Replay protection** — anyone holding the key can replay any captured
-  packet at will. If you need replay protection, embed a timestamp or
-  monotonic counter in the application payload and reject stale values.
 * **Strong authentication** — the topic CRC is a 32-bit tag and would be
   trivial to forge by an attacker who knows the key. Treat encryption
   as an obfuscation layer for adversaries off the L2 segment, not as a
   full authenticated-encryption scheme.
 
-If any of those matter for your deployment, layer a real AEAD inside the
+If either of those matters for your deployment, layer a real AEAD inside the
 payload (e.g. a libsodium `crypto_secretbox` blob in `RAW` mode) or run
 the protocol on an isolated/encrypted L2 (e.g. WireGuard).
 
@@ -237,9 +280,16 @@ reason) if any of the following is true:
 4. `datagram[3]` is not a known encoding value (`0x00` or `0x01`) — unknown encoding.
 5. `datagram[10]` is not a known ENC_MODE value (`0x00` or `0x01`) — unknown enc_mode.
 6. For `ENC_MODE == 0x00`: `12 + PAYLOAD_LEN != len(datagram)` — length mismatch.
-   For `ENC_MODE == 0x01`: `len(datagram) != 12 + max(8, roundup4(4 + PAYLOAD_LEN))` — ciphertext length mismatch.
+   For `ENC_MODE == 0x01`: `len(datagram) != 12 + roundup4(12 + PAYLOAD_LEN)` — ciphertext length mismatch.
 7. `ENC_MODE == 0x01` but no encryption key is configured on this receiver.
 8. The recovered `TOPIC_CRC32` (header field for plaintext, first 4 bytes of decrypted plaintext for encrypted) matches none of the topics this node has subscribed to.
+
+A receiver with replay protection enabled (a configured `replay_window`)
+additionally drops an `ENC_MODE == 0x01` datagram, **after** decryption, if
+its recovered `TIMESTAMP` is more than the window from the local clock, if
+the local clock is unsynced, if `TIMESTAMP == 0`, or if its `NONCE` was
+already seen within the window (§3.3). This is receiver-side policy, not a
+wire-validity rule — an unprotected receiver accepts the same datagram.
 
 For `ENCODING == PROTOBUF` packets, the receiver additionally MUST
 drop the body if:
@@ -290,14 +340,13 @@ A subscriber MUST:
 The following are **not** part of this protocol revision. A v2 may add
 them; if so it will bump `VERSION` to `0x02`.
 
-* **Forward secrecy / replay protection.** The optional XXTEA-256 payload
-  encryption (§3.3) is a long-lived shared key with no rolling counter,
-  so an attacker who later learns the key can decrypt previously-captured
-  traffic, and anyone holding the key can replay captured packets at will.
-  For replay protection, embed a monotonic counter or timestamp in the
-  application payload and reject stale values. For full authenticated
-  encryption, layer a real AEAD inside the payload or run the protocol on
-  an isolated/encrypted L2 (e.g. WireGuard).
+* **Forward secrecy.** The optional XXTEA-256 payload encryption (§3.3) is a
+  long-lived shared key, so an attacker who later learns the key can decrypt
+  previously-captured traffic. (Replay protection against non-key-holders
+  *is* available via the optional `replay_window`; see §3.3. Full
+  authenticated encryption is still out of scope — layer a real AEAD inside
+  the payload or run the protocol on an isolated/encrypted L2 such as
+  WireGuard.)
 * **MQTT-style wildcards.** Each subscription is one exact topic. Bridges
   (see [`examples/05_mqtt_bridge.yaml`](../examples/05_mqtt_bridge.yaml))
   can fan out wildcards on the broker side.

@@ -28,17 +28,20 @@ const (
 
 	// XXTEA-256 constants.
 	xxteaDelta uint32 = 0x9E3779B9
+
+	// Bytes prepended to the XXTEA plaintext, ahead of the user payload:
+	// TOPIC_CRC32 (4) + TIMESTAMP (4) + NONCE (4). The CRC is the integrity
+	// tag; the timestamp + nonce feed receiver-side replay rejection.
+	xxteaPrefixLen = 12
 )
 
 // XXTEACiphertextLen is the on-wire ciphertext length for a plaintext mpubsub
-// payload of `plaintextLen` bytes. The plaintext is `[topic_crc32 LE (4 bytes)]
-// || payload`, zero-padded up to a multiple of 4 bytes (XXTEA word size) with
-// an 8-byte floor (XXTEA requires n>=2 words).
+// payload of `plaintextLen` bytes. The plaintext is `[crc32 || timestamp ||
+// nonce] (12 bytes) || payload`, zero-padded up to a multiple of 4 bytes
+// (XXTEA word size). The 12-byte prefix already clears XXTEA's 2-word (8-byte)
+// minimum, so no separate floor is needed.
 func XXTEACiphertextLen(plaintextLen int) int {
-	needed := plaintextLen + 4
-	if needed < 8 {
-		return 8
-	}
+	needed := plaintextLen + xxteaPrefixLen
 	return (needed + 3) &^ 3
 }
 
@@ -163,9 +166,14 @@ func TopicCRC32(topic string) uint32 {
 
 // EncodePacket builds the 12-byte header + payload datagram. When `key` is
 // non-nil (32 bytes), the body is XXTEA-256 ciphertext over
-// `[topic_crc32 LE (4 bytes)] || payload || zero pad`; the cleartext
+// `[crc32 || timestamp || nonce] || payload || zero pad`; the cleartext
 // TOPIC_CRC32 field is zeroed and PAY_LEN holds the plaintext length.
-func EncodePacket(topic string, payload []byte, encoding byte, key []byte) ([]byte, error) {
+//
+// `timestamp` (unix epoch seconds) and `nonce` feed the receiver's replay
+// rejection and are ignored for plaintext (key == nil). A timestamp of 0
+// marks "the sender had no synchronized clock" and is dropped by a
+// replay-checking receiver.
+func EncodePacket(topic string, payload []byte, encoding byte, key []byte, timestamp, nonce uint32) ([]byte, error) {
 	if encoding != encodingRaw && encoding != encodingProto {
 		return nil, fmt.Errorf("unknown encoding 0x%02x", encoding)
 	}
@@ -192,9 +200,12 @@ func EncodePacket(topic string, payload []byte, encoding byte, key []byte) ([]by
 				len(payload), clen)
 		}
 		plain := make([]byte, clen)
+		// 12-byte prefix: crc | timestamp | nonce, all little-endian.
 		binary.LittleEndian.PutUint32(plain[0:4], crc)
-		copy(plain[4:], payload)
-		// plain[4+len(payload):] is already zero (Go zero-initializes byte slices).
+		binary.LittleEndian.PutUint32(plain[4:8], timestamp)
+		binary.LittleEndian.PutUint32(plain[8:12], nonce)
+		copy(plain[xxteaPrefixLen:], payload)
+		// plain[12+len(payload):] is already zero (Go zero-initializes slices).
 		words := bytesToWordsLE(plain)
 		xxteaEncrypt(words, bytesToWordsLE(key))
 		body = wordsToBytesLE(words)
@@ -221,6 +232,10 @@ type DecodedPacket struct {
 	EncMode      byte
 	WasEncrypted bool
 	Payload      []byte // decrypted plaintext if WasEncrypted, raw body otherwise
+	// Timestamp and Nonce are the replay fields recovered from an encrypted
+	// packet's ciphertext prefix; both are 0 for plaintext packets.
+	Timestamp uint32
+	Nonce     uint32
 }
 
 var (
@@ -275,12 +290,16 @@ func DecodePacket(data []byte, key []byte) (*DecodedPacket, error) {
 		xxteaDecrypt(words, bytesToWordsLE(key))
 		plain := wordsToBytesLE(words)
 		crc := binary.LittleEndian.Uint32(plain[0:4])
+		ts := binary.LittleEndian.Uint32(plain[4:8])
+		nonce := binary.LittleEndian.Uint32(plain[8:12])
 		return &DecodedPacket{
 			TopicCRC:     crc,
 			Encoding:     enc,
 			EncMode:      encMode,
 			WasEncrypted: true,
-			Payload:      plain[4 : 4+int(payloadLen)],
+			Payload:      plain[xxteaPrefixLen : xxteaPrefixLen+int(payloadLen)],
+			Timestamp:    ts,
+			Nonce:        nonce,
 		}, nil
 	}
 	if int(payloadLen)+headerLen != len(data) {

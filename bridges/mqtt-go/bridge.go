@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +22,10 @@ type Bridge struct {
 	scope Scope
 	mqtt  mqtt.Client
 	mcast *MulticastSocket
+
+	// replay rejects stale / duplicate encrypted packets when
+	// encryption.replay_window is configured (inert otherwise).
+	replay *replayGuard
 
 	// crcToMQTT[topic_crc] = list of MQTT topic + QoS/retain to publish to
 	// when a multicast packet arrives with that CRC. Multiple entries are
@@ -87,9 +93,23 @@ func NewBridge(cfg *Config, log *slog.Logger) (*Bridge, error) {
 		mcast:          sock,
 		crcToMQTT:      make(map[uint32][]mpubsubToMQTTRoute),
 		indefiniteJobs: make(map[string]chan struct{}),
-		log:            log,
+		// The bridge runs on a real host, so a generous de-dup cache costs
+		// little; 4096 entries spans a busy window without evicting early.
+		replay: newReplayGuard(cfg.MPubsub.ReplayWindowSeconds, 4096),
+		log:    log,
 	}
 	return b, nil
+}
+
+// randNonce returns a fresh 32-bit per-message nonce for the replay fields.
+// crypto/rand keeps distinct publications distinct even at high rates.
+func randNonce() uint32 {
+	var b [4]byte
+	// crypto/rand.Read never returns a short read without an error; on the
+	// vanishingly unlikely error we fall back to a zero nonce, which only
+	// weakens de-dup for that one packet.
+	_, _ = rand.Read(b[:])
+	return binary.LittleEndian.Uint32(b[:])
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
@@ -201,7 +221,15 @@ func (b *Bridge) handleMQTTMessage(mpubsubTopic string, group net.IP, msg mqtt.M
 		copy(body[2:], protoBody)
 		encoding = encodingProto
 	}
-	pkt, err := EncodePacket(mpubsubTopic, body, encoding, b.cfg.MPubsub.EncryptionKey)
+	// Stamp encrypted publishes with the current time + a random nonce so a
+	// replay-checking receiver can reject stale/duplicate copies. Ignored for
+	// plaintext (key == nil).
+	var ts, nonce uint32
+	if b.cfg.MPubsub.EncryptionKey != nil {
+		ts = uint32(time.Now().Unix())
+		nonce = randNonce()
+	}
+	pkt, err := EncodePacket(mpubsubTopic, body, encoding, b.cfg.MPubsub.EncryptionKey, ts, nonce)
 	if err != nil {
 		b.log.Warn("encode packet failed",
 			"mqtt_topic", msg.Topic(), "mpubsub_topic", mpubsubTopic, "err", err)
@@ -336,6 +364,16 @@ func (b *Bridge) mcastReceiveLoop(ctx context.Context) {
 		if err != nil {
 			b.log.Debug("dropped packet", "err", err, "bytes", n)
 			continue
+		}
+		// Replay rejection for encrypted packets: drop anything stale or
+		// repeating a recently-seen nonce. The bridge always has a real
+		// clock, so now_valid is true.
+		if pkt.WasEncrypted && b.replay.enabled() {
+			if !b.replay.accept(uint32(time.Now().Unix()), true, pkt.Timestamp, pkt.Nonce) {
+				b.log.Debug("dropped replayed/stale packet",
+					"crc", pkt.TopicCRC, "ts", pkt.Timestamp, "nonce", pkt.Nonce)
+				continue
+			}
 		}
 		routes := b.crcToMQTT[pkt.TopicCRC]
 		if len(routes) == 0 {

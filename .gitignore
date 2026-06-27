@@ -5,7 +5,11 @@ tests/.esphome/
 # Native C++ test harness build outputs
 tests/unit/topic_hash_test
 tests/unit/wire_format_test
+tests/unit/replay_guard_test
 tests/unit/*.o
+
+# Go bridge build output
+bridges/mqtt-go/mqtt-go
 
 # Python
 __pycache__/
@@ -23,3 +27,4 @@ esphome/
 tests/unit/__pycache__/
 tests/unit/topic_hash_test_san
 tests/unit/wire_format_test_san
+tests/unit/replay_guard_test_san

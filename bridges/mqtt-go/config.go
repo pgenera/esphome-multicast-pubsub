@@ -69,12 +69,20 @@ type MPubsubConfig struct {
 	// EncryptionKey is the 32-byte SHA-256 of Encryption.Key, derived at
 	// config-load time. Not user-facing; populated by applyDefaults.
 	EncryptionKey []byte `yaml:"-"`
+
+	// ReplayWindowSeconds is the parsed encryption.replay_window in seconds
+	// (0 = replay protection off). Populated by applyDefaults.
+	ReplayWindowSeconds uint32 `yaml:"-"`
 }
 
 // EncryptionConfig matches the ESPHome packet_transport / mpubsub idiom
 // of `encryption: { key: "..." }` so YAML blocks are familiar.
 type EncryptionConfig struct {
 	Key string `yaml:"key"`
+	// ReplayWindow enables replay protection: encrypted packets stamped more
+	// than this far from the bridge clock, or repeating a recently-seen
+	// nonce, are dropped. Any Go duration string (e.g. "30s"). Empty = off.
+	ReplayWindow string `yaml:"replay_window"`
 }
 
 type BridgeEntry struct {
@@ -181,6 +189,20 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.MPubsub.Encryption.Key != "" {
 		c.MPubsub.EncryptionKey = DeriveKey(c.MPubsub.Encryption.Key)
+	}
+	if c.MPubsub.Encryption.ReplayWindow != "" {
+		d, err := time.ParseDuration(c.MPubsub.Encryption.ReplayWindow)
+		if err != nil {
+			return fmt.Errorf("mpubsub.encryption.replay_window %q: %w",
+				c.MPubsub.Encryption.ReplayWindow, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("mpubsub.encryption.replay_window must be > 0 (got %s)", d)
+		}
+		if len(c.MPubsub.EncryptionKey) == 0 {
+			return fmt.Errorf("mpubsub.encryption.replay_window requires encryption.key")
+		}
+		c.MPubsub.ReplayWindowSeconds = uint32(d.Seconds())
 	}
 	if !c.JSONTranslation {
 		if len(c.Schemas) > 0 {

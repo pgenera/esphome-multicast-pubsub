@@ -11,11 +11,15 @@ free of any ESPHome dependency so it can also be used by:
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import ipaddress
+import os
 import struct
+import time
 import zlib
 from dataclasses import dataclass
+from typing import NamedTuple
 
 MAGIC = b"MP"
 VERSION = 0x01
@@ -139,15 +143,25 @@ def _words_to_bytes(words: list[int]) -> bytes:
     return struct.pack(f"<{len(words)}I", *words)
 
 
+# Fixed prefix carried at the start of every XXTEA plaintext, ahead of the
+# user payload:
+#   [ TOPIC_CRC32 LE (4) ][ TIMESTAMP LE (4) ][ NONCE LE (4) ]
+# TIMESTAMP is unix epoch seconds (0 = the sender had no synchronized clock);
+# NONCE is 4 random bytes per message. Together they give the receiver a
+# freshness reference (the clock) and a per-message identity (the nonce) for
+# replay rejection -- see ReplayGuard. The CRC stays the integrity tag.
+XXTEA_PREFIX_LEN = 12
+
+
 def xxtea_ciphertext_len(plaintext_len: int) -> int:
     """Length of the ciphertext for an mpubsub payload of ``plaintext_len`` bytes.
 
-    The plaintext is ``[topic_crc32 LE (4 bytes)] || payload``, zero-padded
-    up to a multiple of 4 bytes (XXTEA word size), with an 8-byte floor.
+    The plaintext is ``[crc32 || timestamp || nonce] (12 bytes) || payload``,
+    zero-padded up to a multiple of 4 bytes (XXTEA word size). The 12-byte
+    prefix already exceeds XXTEA's 2-word (8-byte) minimum, so no separate
+    floor is needed.
     """
-    needed = plaintext_len + 4
-    if needed < 8:
-        return 8
+    needed = plaintext_len + XXTEA_PREFIX_LEN
     return (needed + 3) & ~3
 
 
@@ -164,6 +178,8 @@ def encode(
     encoding: int = ENCODING_RAW,
     *,
     key: bytes | None = None,
+    timestamp: int | None = None,
+    nonce: int | None = None,
 ) -> bytes:
     """Serialize a publication to the on-wire byte sequence.
 
@@ -172,9 +188,16 @@ def encode(
     datagram would exceed :data:`MAX_DATAGRAM`.
 
     When ``key`` is set, the body is XXTEA-256 ciphertext over
-    ``[topic_crc32 LE || payload || zero pad]``. The cleartext header's
-    TOPIC_CRC32 field is set to zero; the real CRC32 is the first 4 bytes
-    of the decrypted plaintext.
+    ``[crc32 || timestamp || nonce] || payload || zero pad`` (see
+    :data:`XXTEA_PREFIX_LEN`). The cleartext header's TOPIC_CRC32 field is
+    set to zero; the real CRC32 is the first 4 bytes of the decrypted
+    plaintext.
+
+    ``timestamp`` (unix epoch seconds) and ``nonce`` (a 32-bit value) feed
+    the receiver's replay rejection. They default to the current wall clock
+    and a fresh random value; pass them explicitly for deterministic
+    encodings (known-answer vectors). ``timestamp=0`` marks "the sender had
+    no synchronized clock" and is rejected by a replay-checking receiver.
     """
     if len(payload) > MAX_PAYLOAD:
         raise ValueError(f"payload too large ({len(payload)} > {MAX_PAYLOAD})")
@@ -188,12 +211,17 @@ def encode(
     else:
         if len(key) != 32:
             raise ValueError(f"key must be 32 bytes, got {len(key)}")
+        if timestamp is None:
+            timestamp = int(time.time())
+        if nonce is None:
+            nonce = int.from_bytes(os.urandom(4), "little")
         clen = xxtea_ciphertext_len(len(payload))
         if HEADER_LEN + clen > MAX_DATAGRAM:
             raise ValueError(
                 f"encrypted payload too large ({len(payload)} -> {clen}-byte ciphertext)"
             )
-        plaintext = struct.pack("<I", crc) + payload + b"\x00" * (clen - 4 - len(payload))
+        prefix = struct.pack("<III", crc, timestamp & 0xFFFFFFFF, nonce & 0xFFFFFFFF)
+        plaintext = prefix + payload + b"\x00" * (clen - XXTEA_PREFIX_LEN - len(payload))
         words = _bytes_to_words(plaintext)
         xxtea_encrypt(words, _bytes_to_words(key))
         body = _words_to_bytes(words)
@@ -214,18 +242,35 @@ class WireError(ValueError):
     """Raised by :func:`decode` when a packet violates the spec."""
 
 
-def decode(data: bytes, *, key: bytes | None = None) -> tuple[int, int, bytes]:
-    """Parse a datagram.
+class DecodedMessage(NamedTuple):
+    """Result of :func:`decode`.
 
-    Returns ``(topic_crc32, encoding, payload)``.
+    ``timestamp`` and ``nonce`` are populated only for encrypted packets
+    (``was_encrypted=True``); they are ``None`` for plaintext. A replay-aware
+    receiver feeds them to :class:`ReplayGuard`. The first three fields keep
+    the historical ``(topic_crc, encoding, payload)`` order so callers that
+    only care about those can unpack ``crc, encoding, body, *_``.
+    """
+
+    topic_crc: int
+    encoding: int
+    payload: bytes
+    timestamp: int | None = None
+    nonce: int | None = None
+    was_encrypted: bool = False
+
+
+def decode(data: bytes, *, key: bytes | None = None) -> DecodedMessage:
+    """Parse a datagram into a :class:`DecodedMessage`.
 
     For encrypted packets the caller MUST supply ``key`` (the 32-byte
-    XXTEA-256 key); the returned ``topic_crc32`` is recovered from the
-    decrypted plaintext and ``payload`` is the decrypted slice.
+    XXTEA-256 key); the returned ``topic_crc`` is recovered from the
+    decrypted plaintext, ``payload`` is the decrypted slice, and
+    ``timestamp`` / ``nonce`` carry the replay fields.
 
     Raises :class:`WireError` if any validation rule fails or if an
     encrypted packet arrives with ``key=None``. The caller is expected to
-    match ``topic_crc32`` against the subscriptions on this node.
+    match ``topic_crc`` against the subscriptions on this node.
     """
     if len(data) < HEADER_LEN:
         raise WireError(f"datagram too short ({len(data)} < {HEADER_LEN})")
@@ -257,13 +302,88 @@ def decode(data: bytes, *, key: bytes | None = None) -> tuple[int, int, bytes]:
         words = _bytes_to_words(data[HEADER_LEN:])
         xxtea_decrypt(words, _bytes_to_words(key))
         plaintext = _words_to_bytes(words)
-        crc = struct.unpack("<I", plaintext[0:4])[0]
-        body = plaintext[4 : 4 + payload_len]
-        return crc, encoding, body
+        crc, ts, nonce = struct.unpack("<III", plaintext[0:XXTEA_PREFIX_LEN])
+        body = plaintext[XXTEA_PREFIX_LEN : XXTEA_PREFIX_LEN + payload_len]
+        return DecodedMessage(crc, encoding, body, ts, nonce, was_encrypted=True)
     # Plaintext path
     if HEADER_LEN + payload_len != len(data):
         raise WireError(
             f"length mismatch: header says {payload_len}, datagram has "
             f"{len(data) - HEADER_LEN}"
         )
-    return header_crc, encoding, data[HEADER_LEN:]
+    return DecodedMessage(header_crc, encoding, data[HEADER_LEN:])
+
+
+# ----------------------------------------------------------------------------
+# Replay rejection (Option B)
+#
+# A captured encrypted datagram is byte-identical no matter when it is
+# resent, so anyone off the segment can replay it. The defense is two-layer
+# and needs no persistent state -- it survives a reboot because the freshness
+# reference is the externally-synced wall clock, not a stored counter:
+#
+#   1. Freshness window. The sender stamps each packet with the current unix
+#      time inside the ciphertext (an attacker without the key can't move it
+#      without breaking the CRC). The receiver drops anything more than
+#      `window` seconds from its own clock.
+#
+#   2. Nonce de-duplication. Within the window an attacker could still resend
+#      a verbatim copy, so the receiver remembers the per-message nonces it
+#      has seen in the last `window` seconds and drops repeats. The cache is
+#      bounded and may be empty after a reboot -- harmless, because layer 1
+#      already rejects anything older than the window.
+#
+# Legitimate retransmits (retransmit_count > 1) reuse the same nonce, so
+# de-dup collapses them to a single delivery; two genuinely distinct
+# publications carry different nonces even if their payloads are identical.
+# ----------------------------------------------------------------------------
+
+
+class ReplayGuard:
+    """Receiver-side freshness window + bounded nonce de-dup cache.
+
+    Mirrors ``components/mpubsub/replay_guard.h`` (C++) and the Go bridge's
+    ``replayGuard`` so all three agree on accept/reject for any
+    ``(now, timestamp, nonce)``.
+    """
+
+    def __init__(self, window_seconds: int, max_entries: int = 128) -> None:
+        self.window = window_seconds
+        self.max_entries = max_entries
+        self._order: collections.deque[tuple[int, int]] = collections.deque()
+        self._seen: dict[int, int] = {}
+
+    def accept(
+        self, now: int, now_valid: bool, timestamp: int | None, nonce: int | None
+    ) -> bool:
+        """Return True if a packet stamped ``timestamp``/``nonce`` is fresh
+        and unseen, recording it. Return False (drop) otherwise.
+
+        ``window == 0`` disables protection (always accept). When protection
+        is on the guard fails closed: an unsynced local clock
+        (``now_valid=False``) or a packet with ``timestamp==0`` (sender had
+        no clock) is rejected.
+        """
+        if self.window == 0:
+            return True
+        if not now_valid:
+            return False
+        if not timestamp:  # 0 or None -> unverifiable
+            return False
+        if abs(now - timestamp) > self.window:
+            return False
+        self._prune(now)
+        if nonce in self._seen:
+            return False
+        self._seen[nonce] = timestamp
+        self._order.append((nonce, timestamp))
+        if len(self._order) > self.max_entries:
+            old_nonce, _ = self._order.popleft()
+            self._seen.pop(old_nonce, None)
+        return True
+
+    def _prune(self, now: int) -> None:
+        cutoff = now - self.window
+        while self._order and self._order[0][1] < cutoff:
+            old_nonce, _ = self._order.popleft()
+            self._seen.pop(old_nonce, None)
