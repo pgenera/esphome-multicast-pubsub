@@ -539,22 +539,7 @@ void MulticastPubSub::on_packet_(std::span<const uint8_t> raw) {
     return;
   }
   if (pkt.enc_mode == EncMode::XXTEA) {
-    if (!this->encryption_enabled_) {
-      ESP_LOGV(TAG, "drop encrypted packet: this node has no encryption key");
-      return;
-    }
-    std::array<uint8_t, MAX_DATAGRAM> work;
-    size_t clen = pkt.payload.size();
-    if (clen > work.size()) {
-      ESP_LOGV(TAG, "drop encrypted packet: ciphertext %zu exceeds buffer", clen);
-      return;
-    }
-    std::memcpy(work.data(), pkt.payload.data(), clen);
-    xxtea::decrypt(reinterpret_cast<uint32_t *>(work.data()), clen / 4,
-                   reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
-    uint32_t crc = uint32_t(work[0]) | (uint32_t(work[1]) << 8) | (uint32_t(work[2]) << 16) | (uint32_t(work[3]) << 24);
-    std::span<const uint8_t> body(work.data() + 4, pkt.plaintext_len);
-    this->deliver_(crc, pkt.encoding, body, /*was_encrypted=*/true);
+    this->handle_encrypted_(pkt);
     return;
   }
   this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false);
