@@ -6,6 +6,7 @@ tests/.esphome/
 tests/unit/topic_hash_test
 tests/unit/wire_format_test
 tests/unit/replay_guard_test
+tests/unit/chacha_test
 tests/unit/*.o
 
 # Go bridge build output
@@ -28,3 +29,4 @@ tests/unit/__pycache__/
 tests/unit/topic_hash_test_san
 tests/unit/wire_format_test_san
 tests/unit/replay_guard_test_san
+tests/unit/chacha_test_san

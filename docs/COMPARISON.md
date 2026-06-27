@@ -64,10 +64,11 @@ differences:
 * **Subscription model.** With `packet_transport` you list **providers**
   (hostnames) you want sensors from. With `mpubsub` you list
   **topics** you care about, no matter who sends them.
-* **Encryption / rolling code.** `packet_transport` includes XXTEA
-  encryption and rolling codes against replay. `mpubsub` v1 has
-  neither — security is delegated to network isolation. (A v2 may add an
-  encryption layer reusing `packet_transport`'s XXTEA logic.)
+* **Encryption / replay.** `packet_transport` includes XXTEA encryption and
+  rolling codes against replay. `mpubsub` offers optional ChaCha20-Poly1305
+  (authenticated; RFC 8439) with optional clock-based replay protection
+  (`encryption.replay_window`) — see [`PROTOCOL.md`](PROTOCOL.md) §3.3. Both
+  use a single shared key (no forward secrecy / per-peer identity).
 * **API shape.** `packet_transport` plugs sensors and binary_sensors in;
   `mpubsub` also exposes `publish` / `on_message` MQTT-style
   primitives so it composes cleanly with non-sensor automations

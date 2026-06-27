@@ -61,7 +61,7 @@ type MPubsubConfig struct {
 	PromoteQoS bool `yaml:"promote_qos"`
 
 	// Encryption mirrors the C++ `mpubsub: encryption: key:` block: a
-	// passphrase that's SHA-256'd to a 32-byte XXTEA-256 key. When set, the
+	// passphrase that is SHA-256d to a 32-byte ChaCha20-Poly1305 key. When set, the
 	// bridge encrypts every mqtt → mpubsub publish and can decrypt encrypted
 	// mpubsub → mqtt packets. Leave empty for plaintext.
 	Encryption EncryptionConfig `yaml:"encryption"`

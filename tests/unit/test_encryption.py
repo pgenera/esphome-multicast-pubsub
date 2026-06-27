@@ -1,68 +1,83 @@
-"""XXTEA payload encryption tests against the Python reference."""
+"""ChaCha20-Poly1305 AEAD payload encryption tests against the Python reference."""
 
 from __future__ import annotations
 
 import pytest
 
 from reference import (
+    AEAD_NONCE_LEN,
+    ENC_MODE_AEAD,
     ENC_MODE_NONE,
-    ENC_MODE_XXTEA,
     ENCODING_PROTOBUF,
     ENCODING_RAW,
     HEADER_LEN,
     MAX_DATAGRAM,
     WireError,
+    aead_body_len,
+    aead_decrypt,
+    aead_encrypt,
+    chacha20,
     decode,
     derive_key,
     encode,
     topic_crc32,
-    xxtea_ciphertext_len,
-    xxtea_decrypt,
-    xxtea_encrypt,
 )
 
-
-# --- XXTEA primitive ---------------------------------------------------------
-
-
-def test_xxtea_roundtrip() -> None:
-    key = list(range(8))  # arbitrary 8x uint32
-    words = [0x11111111, 0x22222222, 0x33333333, 0x44444444]
-    original = list(words)
-    xxtea_encrypt(words, key)
-    assert words != original  # actually encrypted
-    xxtea_decrypt(words, key)
-    assert words == original
+# A fixed 12-byte nonce for deterministic encodings in tests.
+NONCE = bytes(range(12))
 
 
-def test_xxtea_wrong_key_does_not_recover() -> None:
-    key = list(range(8))
-    bad = [k ^ 0x1 for k in key]
-    words = [0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0]
-    original = list(words)
-    xxtea_encrypt(words, key)
-    xxtea_decrypt(words, bad)
-    assert words != original
+# --- AEAD primitive (RFC 8439 known-answer vectors) --------------------------
 
 
-# --- Ciphertext length math --------------------------------------------------
+def test_chacha20_keystream_rfc8439() -> None:
+    """RFC 8439 §2.4.2 keystream vector."""
+    key = bytes(range(32))
+    nonce = bytes.fromhex("000000000000004a00000000")
+    ks = chacha20(key, 1, nonce, b"\x00" * 64)
+    assert ks[:16].hex() == "224f51f3401bd9e12fde276fb8631ded"
+
+
+def test_aead_encrypt_rfc8439() -> None:
+    """RFC 8439 §2.8.2 AEAD vector -- locks the primitive to the standard so
+    the C++ and Go ports can be checked against the same numbers."""
+    key = bytes(range(0x80, 0xA0))
+    nonce = bytes.fromhex("070000004041424344454647")
+    aad = bytes.fromhex("50515253c0c1c2c3c4c5c6c7")
+    pt = (
+        b"Ladies and Gentlemen of the class of '99: If I could offer you "
+        b"only one tip for the future, sunscreen would be it."
+    )
+    ct, tag = aead_encrypt(key, nonce, pt, aad)
+    assert ct.hex().startswith("d31a8d34648e60db7b86afbc53ef7ec2")
+    assert tag.hex() == "1ae10b594f09e26a7e902ecbd0600691"
+
+
+def test_aead_roundtrip_and_auth() -> None:
+    key = derive_key("k")
+    ct, tag = aead_encrypt(key, NONCE, b"hello", b"aad")
+    assert aead_decrypt(key, NONCE, ct, tag, b"aad") == b"hello"
+    # A flipped ciphertext byte fails authentication.
+    bad = bytearray(ct)
+    bad[0] ^= 0x01
+    with pytest.raises(WireError, match="authentication failed"):
+        aead_decrypt(key, NONCE, bytes(bad), tag, b"aad")
+
+
+# --- Body length math --------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "plaintext_len,expected",
+    "payload_len,expected",
     [
-        (0, 12),    # 0+12 = 12 -> 12 (prefix is already >= XXTEA's 8-byte min)
-        (1, 16),    # 1+12 = 13 -> 16
-        (3, 16),    # 3+12 = 15 -> 16
-        (4, 16),    # 4+12 = 16 -> 16
-        (5, 20),    # 5+12 = 17 -> 20
-        (8, 20),    # 8+12 = 20 -> 20
-        (9, 24),    # 9+12 = 21 -> 24
-        (100, 112), # 100+12 = 112 -> 112
+        (0, 36),    # 12 nonce + 8 prefix + 0 + 16 tag
+        (1, 37),
+        (5, 41),
+        (100, 136),
     ],
 )
-def test_xxtea_ciphertext_len(plaintext_len: int, expected: int) -> None:
-    assert xxtea_ciphertext_len(plaintext_len) == expected
+def test_aead_body_len(payload_len: int, expected: int) -> None:
+    assert aead_body_len(payload_len) == expected
 
 
 # --- End-to-end encode/decode -----------------------------------------------
@@ -89,54 +104,47 @@ def test_encrypted_roundtrip_protobuf() -> None:
 
 
 def test_encrypted_empty_payload() -> None:
-    """0-byte payloads still produce a valid 12-byte ciphertext (just the
-    crc/timestamp/nonce prefix, no padding needed)."""
+    """0-byte payloads still produce a valid 36-byte body (nonce + 8-byte
+    prefix + 16-byte tag, no ciphertext padding -- ChaCha20 is a stream)."""
     key = derive_key("k")
     pkt = encode("t", b"", key=key)
-    # 12-byte header + 12-byte prefix-only ciphertext = 24 bytes total
-    assert len(pkt) == HEADER_LEN + 12
+    assert len(pkt) == HEADER_LEN + 36
     crc, encoding, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("t")
     assert body == b""
 
 
 def test_encrypted_header_has_zero_crc_field() -> None:
-    """When encrypted, bytes 4-7 (header CRC field) must be zero on the wire.
-
-    The real CRC32 lives at the start of the ciphertext; leaking it in
-    cleartext would let a passive observer fingerprint topics.
-    """
+    """When encrypted, bytes 4-7 (header CRC field) must be zero on the wire
+    so a passive observer can't fingerprint the topic."""
     key = derive_key("k")
     pkt = encode("home/leaky", b"x", key=key)
     assert pkt[4:8] == b"\x00\x00\x00\x00"
 
 
-def test_encrypted_enc_mode_byte_is_xxtea() -> None:
+def test_encrypted_enc_mode_byte_is_aead() -> None:
     key = derive_key("k")
     pkt = encode("t", b"x", key=key)
-    assert pkt[10] == ENC_MODE_XXTEA
+    assert pkt[10] == ENC_MODE_AEAD
 
 
 def test_encrypted_pay_len_is_plaintext_length() -> None:
     key = derive_key("k")
-    payload = b"hello"  # 5 bytes -> 20-byte ciphertext
+    payload = b"hello"  # 5 bytes -> 41-byte body
     pkt = encode("t", payload, key=key)
     pay_len = int.from_bytes(pkt[8:10], "little")
     assert pay_len == len(payload)
-    assert len(pkt) == HEADER_LEN + xxtea_ciphertext_len(len(payload))
+    assert len(pkt) == HEADER_LEN + aead_body_len(len(payload))
 
 
-def test_wrong_key_produces_wrong_crc() -> None:
-    """The integrity check IS the recovered topic CRC: a wrong key gives a
-    random CRC that won't match any subscribed topic.
-    """
+def test_wrong_key_fails_authentication() -> None:
+    """Unlike the old 32-bit-CRC scheme, a wrong key fails the 128-bit
+    Poly1305 tag outright -- decode raises rather than returning garbage."""
     key = derive_key("right")
     bad = derive_key("wrong")
-    payload = b"sensitive"
-    pkt = encode("home/x", payload, key=key)
-    crc, _, body, *_ = decode(pkt, key=bad)
-    assert crc != topic_crc32("home/x")
-    assert body != payload  # body is also garbage; receiver drops on CRC mismatch
+    pkt = encode("home/x", b"sensitive", key=key)
+    with pytest.raises(WireError, match="authentication failed"):
+        decode(pkt, key=bad)
 
 
 def test_decode_encrypted_without_key_raises() -> None:
@@ -161,76 +169,77 @@ def test_encrypted_length_mismatch_rejected() -> None:
         decode(bytes(pkt), key=key)
 
 
+def test_tamper_detected() -> None:
+    """Flipping any body byte (nonce, ciphertext, or tag) fails the tag."""
+    key = derive_key("k")
+    pkt = bytearray(encode("home/x", b"value", key=key))
+    pkt[-1] ^= 0x01  # last byte of the tag
+    with pytest.raises(WireError, match="authentication failed"):
+        decode(bytes(pkt), key=key)
+
+
 def test_max_payload_under_encryption() -> None:
     """Largest payload that still fits the 1232-byte datagram cap when encrypted."""
     key = derive_key("k")
-    # 12 (crc+ts+nonce) + 1208 (payload) = 1220 -> roundup4 = 1220 -> fits exactly
-    pkt = encode("t", b"x" * 1208, key=key)
+    # 12 nonce + 8 prefix + 1184 payload + 16 tag = 1220 body -> 1232 total.
+    pkt = encode("t", b"x" * 1184, key=key)
     assert len(pkt) == MAX_DATAGRAM
     crc, _, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("t")
-    assert body == b"x" * 1208
+    assert body == b"x" * 1184
 
 
 def test_oversize_encrypted_payload_rejected() -> None:
     key = derive_key("k")
     with pytest.raises(ValueError, match="encrypted payload too large"):
-        encode("t", b"x" * 1209, key=key)
+        encode("t", b"x" * 1185, key=key)
 
 
 def test_plaintext_decode_with_key_still_works() -> None:
-    """Decoding a plaintext packet with a key set MUST return the plaintext.
-
-    Mixed-mode deployments (some publishers encrypted, others not) are
-    supported -- the decoder picks the path from the header's ENC_MODE byte.
-    """
+    """Mixed-mode deployments: a plaintext packet decodes even when a key is
+    set -- the decoder picks the path from the header's ENC_MODE byte."""
     key = derive_key("k")
     pkt = encode("t", b"plain", key=None)
     crc, _, body, *_ = decode(pkt, key=key)
     assert crc == topic_crc32("t")
     assert body == b"plain"
+    assert pkt[10] == ENC_MODE_NONE
 
 
 def test_encrypted_packet_is_not_decodable_as_plaintext() -> None:
-    """An encrypted packet's body is gibberish to a plaintext-only decoder."""
+    """An encrypted packet without a key is identified as encrypted and
+    refused, not silently mis-parsed."""
     key = derive_key("k")
-    pkt = encode("t", b"x" * 12, key=key)  # 12 -> 16-byte ciphertext
-    # Drop the key requirement and call decode again: it correctly identifies
-    # the packet as encrypted and refuses to silently return garbage.
+    pkt = encode("t", b"x" * 12, key=key)
     with pytest.raises(WireError):
         decode(pkt)
 
 
-# --- Replay fields (timestamp + nonce inside the ciphertext) -----------------
+# --- Replay fields (timestamp + nonce) ---------------------------------------
 
 
-def test_encrypted_timestamp_nonce_roundtrip() -> None:
+def test_encrypted_timestamp_roundtrip() -> None:
     key = derive_key("k")
-    pkt = encode("t", b"hi", key=key, timestamp=1_700_000_000, nonce=0xDEADBEEF)
+    pkt = encode("t", b"hi", key=key, timestamp=1_700_000_000, nonce=NONCE)
     msg = decode(pkt, key=key)
     assert msg.was_encrypted
     assert msg.timestamp == 1_700_000_000
-    assert msg.nonce == 0xDEADBEEF
+    # The replay de-dup key is the low 32 bits of the AEAD nonce.
+    assert msg.nonce == int.from_bytes(NONCE[0:4], "little")
     assert msg.payload == b"hi"
 
 
 def test_default_nonce_makes_identical_payloads_distinct() -> None:
-    """Two publishes of the same value get different random nonces, so their
-    ciphertexts differ on the wire (and the de-dup cache won't collapse two
-    genuinely distinct messages)."""
     key = derive_key("k")
     a = encode("t", b"same", key=key, timestamp=1_700_000_000)
     b = encode("t", b"same", key=key, timestamp=1_700_000_000)
-    assert a != b
+    assert a != b  # random per-message nonce
 
 
-def test_retransmit_shares_nonce() -> None:
-    """A retransmit re-sends the identical pre-encoded datagram, so the nonce
-    is shared -- that is what lets the receiver collapse retransmits to one
-    delivery instead of treating each as a fresh message."""
+def test_bad_nonce_length_rejected() -> None:
     key = derive_key("k")
-    pkt = encode("t", b"v", key=key, timestamp=1_700_000_000, nonce=0x11223344)
-    assert decode(pkt, key=key).nonce == decode(pkt, key=key).nonce == 0x11223344
+    with pytest.raises(ValueError, match="nonce must be"):
+        encode("t", b"x", key=key, timestamp=1, nonce=b"short")
 
 
 def test_plaintext_has_no_replay_fields() -> None:

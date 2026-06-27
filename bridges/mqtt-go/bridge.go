@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -101,15 +100,17 @@ func NewBridge(cfg *Config, log *slog.Logger) (*Bridge, error) {
 	return b, nil
 }
 
-// randNonce returns a fresh 32-bit per-message nonce for the replay fields.
-// crypto/rand keeps distinct publications distinct even at high rates.
-func randNonce() uint32 {
-	var b [4]byte
+// randNonce returns a fresh 12-byte ChaCha20-Poly1305 nonce. It must be
+// unique per key; a 96-bit random value collides only after ~2^48 messages,
+// far beyond any bridge's lifetime. Its low 32 bits double as the replay
+// de-dup identity on the receive side.
+func randNonce() []byte {
+	b := make([]byte, aeadNonceLen)
 	// crypto/rand.Read never returns a short read without an error; on the
 	// vanishingly unlikely error we fall back to a zero nonce, which only
-	// weakens de-dup for that one packet.
-	_, _ = rand.Read(b[:])
-	return binary.LittleEndian.Uint32(b[:])
+	// weakens de-dup (and nonce uniqueness) for that one packet.
+	_, _ = rand.Read(b)
+	return b
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
@@ -224,7 +225,8 @@ func (b *Bridge) handleMQTTMessage(mpubsubTopic string, group net.IP, msg mqtt.M
 	// Stamp encrypted publishes with the current time + a random nonce so a
 	// replay-checking receiver can reject stale/duplicate copies. Ignored for
 	// plaintext (key == nil).
-	var ts, nonce uint32
+	var ts uint32
+	var nonce []byte
 	if b.cfg.MPubsub.EncryptionKey != nil {
 		ts = uint32(time.Now().Unix())
 		nonce = randNonce()

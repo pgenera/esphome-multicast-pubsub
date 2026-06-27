@@ -41,7 +41,7 @@ See [`bridge.example.yaml`](bridge.example.yaml) for the config shape.
 | `mpubsub` | `retransmit_delay` | `100ms` | Spacing between successive sends. Go duration string (`"100ms"`, `"1s"`, `"0s"`). `0` supported for finite counts. |
 | `mpubsub` | `promote_qos` | `false` | When true, the incoming MQTT QoS bumps the effective retransmit_count: QoS 0 unchanged, QoS 1 → `max(retransmit_count, 3)`, QoS 2 → `-1` (indefinite). |
 | `mpubsub` | `interface` | (kernel default) | Egress interface name (`eth0`, `br-lan`, …). |
-| `mpubsub` | `encryption.key` | — | Optional XXTEA-256 passphrase, SHA-256'd to a 32-byte key. Must match the ESPHome devices' `mpubsub.encryption.key`. Enables encrypting outbound `mqtt_to_mpubsub` traffic and decrypting inbound `mpubsub_to_mqtt` traffic. |
+| `mpubsub` | `encryption.key` | — | Optional ChaCha20-Poly1305 passphrase, SHA-256d to a 32-byte key. Must match the ESPHome devices' `mpubsub.encryption.key`. Enables encrypting outbound `mqtt_to_mpubsub` traffic and decrypting inbound `mpubsub_to_mqtt` traffic. |
 | `mpubsub` | `encryption.replay_window` | — | Optional Go duration (e.g. `30s`). When set, outbound encrypted publishes are stamped with the bridge clock + a random nonce, and inbound encrypted packets that are stale or repeat a recently-seen nonce are dropped. Mirrors the ESPHome devices' `mpubsub.encryption.replay_window`; requires `encryption.key`. |
 | `bridges[]` | `direction` | — | `mqtt_to_mpubsub` or `mpubsub_to_mqtt`. One-directional. |
 | `bridges[]` | `mqtt_topic` | — | The MQTT topic to subscribe to (mqtt→mpubsub) or publish to (mpubsub→mqtt). MQTT wildcards (`+`, `#`) are accepted on `mqtt_to_mpubsub` entries. |

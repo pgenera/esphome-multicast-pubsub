@@ -101,7 +101,7 @@ Total: **12-byte header + up to 1220 bytes body = 1232-byte datagram.**
 |      8 |    2 | `PAYLOAD_LEN`| Little-endian uint16; the **plaintext** payload length. For `ENC_MODE == 0` it equals `len(datagram) - 12`; for `ENC_MODE == 1` it is the user payload size and the on-wire body is longer (see §3.3). |
 |     10 |    1 | `ENC_MODE`   | Encryption mode enum (see §3.3). `0x00` = plaintext (default). |
 |     11 |    1 | `RESERVED`   | Senders MUST write `0x00`. Receivers MUST ignore.              |
-|     12 | ≤1220| `BODY`       | Encoding-dependent (see §3.1) and possibly XXTEA-encrypted (see §3.3). |
+|     12 | ≤1220| `BODY`       | Encoding-dependent (see §3.1) and possibly AEAD-encrypted (see §3.3). |
 
 ### 3.1 ENCODING byte and body layout
 
@@ -174,23 +174,29 @@ Byte 10 is a 1-byte enum signalling whether the body has been encrypted:
 | Value      | Name     | Body layout                                                       |
 |-----------:|----------|-------------------------------------------------------------------|
 | `0x00`     | `NONE`   | Plaintext (default; the body is exactly the §3.1 layout).         |
-| `0x01`     | `XXTEA`  | XXTEA-256 ciphertext over a 12-byte prefix followed by the plaintext payload: `[TOPIC_CRC32 LE (4)] || [TIMESTAMP LE (4)] || [NONCE LE (4)] || payload`, zero-padded up to `roundup4(12 + PAYLOAD_LEN)` bytes. The 12-byte prefix already exceeds XXTEA's 2-word (8-byte) minimum, so no separate floor is needed. |
+| `0x01`     | `AEAD`   | ChaCha20-Poly1305 (RFC 8439): `[AEAD_NONCE (12)] || ciphertext || [TAG (16)]`. The ciphertext encrypts an 8-byte prefix followed by the payload — `[TOPIC_CRC32 LE (4)] || [TIMESTAMP LE (4)] || payload` — and the 12-byte cleartext header is the AAD. ChaCha20 is a stream cipher, so the ciphertext is exactly `8 + PAYLOAD_LEN` bytes (no padding); total body `= 36 + PAYLOAD_LEN`. |
 | `0x02..FF` | reserved | Receivers MUST drop.                                              |
 
-The prefix carries three fields ahead of the user payload:
+The body carries, around the encrypted payload:
 
-* **`TOPIC_CRC32`** — the integrity tag (see "Integrity check" below).
-* **`TIMESTAMP`** — unix epoch seconds at send time, or `0` if the sender
-  has no synchronized clock. Drives the receiver's freshness check.
-* **`NONCE`** — 4 random bytes per message. Gives every publication a
-  distinct identity even when two payloads are byte-identical, and is the
-  key the receiver de-duplicates on. A retransmit (`retransmit_count > 1`)
-  re-sends the same datagram and so reuses its nonce, which lets the
-  receiver collapse retransmits to a single delivery.
+* **`AEAD_NONCE`** — 12 random bytes per message, in cleartext (needed to
+  decrypt). It must be unique per key; random 96-bit values collide only
+  after ~`2⁴⁸` messages. Its low 32 bits are the receiver's de-duplication
+  identity, so every publication is distinct even when two payloads are
+  byte-identical. A retransmit (`retransmit_count > 1`) re-sends the same
+  datagram and so reuses its nonce, letting the receiver collapse
+  retransmits to a single delivery.
+* **`TOPIC_CRC32`** (encrypted) — used by the receiver to match the packet to
+  a subscription. It is confidential (so the topic isn't leaked) and
+  authenticated (under the tag).
+* **`TIMESTAMP`** (encrypted) — unix epoch seconds at send time, or `0` if
+  the sender has no synchronized clock. Drives the receiver's freshness check.
+* **`TAG`** — the 128-bit Poly1305 authentication tag over the AAD (header)
+  and ciphertext.
 
-**Key derivation.** The 32-byte XXTEA-256 key is `SHA-256(passphrase)`,
-identical to the convention `packet_transport` uses for its
-`encryption.key` option. Configure once on every participating node:
+**Key derivation.** The 32-byte key is `SHA-256(passphrase)`, identical to the
+convention `packet_transport` uses for its `encryption.key` option. Configure
+once on every participating node:
 
 ```yaml
 mpubsub:
@@ -198,20 +204,20 @@ mpubsub:
     key: "any-length passphrase"
 ```
 
-The C++ implementation reuses ESPHome's `esphome::xxtea::encrypt`/`decrypt`
-helpers (which `packet_transport` already vendored), so the on-wire bytes
-are byte-for-byte compatible with that algorithm.
+The cipher is a vendored, self-contained RFC 8439 implementation (ChaCha20 +
+the 32-bit "poly1305-donna" arithmetic), so it builds identically on ESP32 and
+ESP8266 without depending on a platform TLS library — measured at ~5 KB of
+flash and negligible RAM on an ESP8266.
 
-**Integrity check.** There is no separate MAC. The integrity tag is the
-`TOPIC_CRC32` carried at the start of the ciphertext: a wrong key produces
-a random 32-bit value that with probability `1 − 2⁻³²` won't match any
-subscribed topic, so the packet is silently dropped at dispatch (§4 rule
-6). The cleartext header's `TOPIC_CRC32` field (bytes 4–7) is forced to
-zero when `ENC_MODE != NONE` to avoid leaking the topic identity to a
-passive observer.
+**Integrity & authentication.** The Poly1305 tag is a real 128-bit MAC: a
+wrong key or any tampering (to the header AAD, nonce, ciphertext, or tag)
+fails authentication and the packet is dropped before dispatch. The cleartext
+header's `TOPIC_CRC32` field (bytes 4–7) is forced to zero when
+`ENC_MODE != NONE` so the topic identity isn't leaked to a passive observer
+(the real CRC lives encrypted in the ciphertext prefix).
 
 **Mixed-mode deployments.** Receivers that have an encryption key
-configured accept both `ENC_MODE = NONE` and `ENC_MODE = XXTEA` packets —
+configured accept both `ENC_MODE = NONE` and `ENC_MODE = AEAD` packets —
 the decoder picks the path from the header byte. Receivers without a key
 configured drop encrypted packets. Individual subscriptions can opt in to
 encryption-only mode by setting `require_encryption: true` on an
@@ -219,7 +225,7 @@ encryption-only mode by setting `require_encryption: true` on an
 datagrams for that topic are then dropped at dispatch regardless of what
 other subscribers want.
 
-**Replay protection (optional).** A captured XXTEA datagram is byte-identical
+**Replay protection (optional).** A captured AEAD datagram is byte-identical
 however long after it was recorded, so anyone off the L2 segment can resend
 it. Enabling a freshness window turns the in-ciphertext `TIMESTAMP` + `NONCE`
 into replay rejection, with **no persistent state and no inter-node
@@ -238,10 +244,10 @@ mpubsub:
 The receiver applies two layers:
 
 1. **Freshness window.** Drop any packet whose `TIMESTAMP` is more than
-   `replay_window` seconds from the receiver's own clock. The timestamp lives
-   inside the ciphertext, so an attacker without the key cannot move it
-   without breaking the CRC — they can only resend a verbatim copy, which the
-   window confines to a short tail.
+   `replay_window` seconds from the receiver's own clock. The timestamp is
+   inside the ciphertext and under the tag, so an attacker without the key
+   cannot move it without failing authentication — they can only resend a
+   verbatim copy, which the window confines to a short tail.
 2. **Nonce de-duplication.** Within that window the receiver remembers the
    nonces it has recently seen (a bounded ring, so RAM stays fixed on
    ESP8266-class devices) and drops repeats.
@@ -250,24 +256,22 @@ The guard **fails closed**: while protection is on, a packet with
 `TIMESTAMP == 0` (the sender had no synced clock) or a receiver whose own
 clock has not yet synced is rejected, never silently admitted. The cache may
 be empty after a reboot — harmless, because layer 1 already rejects anything
-older than the window. This defends against any attacker **without** the key;
-a key-holder can still mint fresh packets, which replay protection alone
-cannot stop (see authentication, below).
+older than the window. Replay protection defends against any attacker
+**without** the key; a key-holder can still mint fresh packets, which no
+replay scheme can stop.
 
-**Security caveats.** Even with replay protection on, this scheme provides
-**confidentiality and weak integrity** within the threat model of "passive
-eavesdroppers and unkeyed attackers". It does **not** provide:
+**Security caveats.** This scheme provides **confidentiality and strong
+integrity/authentication** (a 128-bit Poly1305 tag) against anyone without the
+key. It does **not** provide:
 
-* **Forward secrecy** — the key is long-lived; capture-now-decrypt-later
-  is feasible if the passphrase later leaks.
-* **Strong authentication** — the topic CRC is a 32-bit tag and would be
-  trivial to forge by an attacker who knows the key. Treat encryption
-  as an obfuscation layer for adversaries off the L2 segment, not as a
-  full authenticated-encryption scheme.
+* **Forward secrecy** — the key is long-lived and shared, so a
+  capture-now-decrypt-later adversary wins if the passphrase later leaks, and
+  any key-holder can both read and forge traffic. The encryption boundary is
+  "holds the shared key" vs "doesn't", not per-sender identity.
 
-If either of those matters for your deployment, layer a real AEAD inside the
-payload (e.g. a libsodium `crypto_secretbox` blob in `RAW` mode) or run
-the protocol on an isolated/encrypted L2 (e.g. WireGuard).
+If that matters for your deployment, use a scheme with per-peer keys and key
+rotation (e.g. run the protocol on an isolated/encrypted L2 such as
+WireGuard).
 
 ## 4. Validation rules
 
@@ -280,9 +284,10 @@ reason) if any of the following is true:
 4. `datagram[3]` is not a known encoding value (`0x00` or `0x01`) — unknown encoding.
 5. `datagram[10]` is not a known ENC_MODE value (`0x00` or `0x01`) — unknown enc_mode.
 6. For `ENC_MODE == 0x00`: `12 + PAYLOAD_LEN != len(datagram)` — length mismatch.
-   For `ENC_MODE == 0x01`: `len(datagram) != 12 + roundup4(12 + PAYLOAD_LEN)` — ciphertext length mismatch.
+   For `ENC_MODE == 0x01`: `len(datagram) != 12 + 36 + PAYLOAD_LEN` (header + nonce + prefix + payload + tag) — encrypted body length mismatch.
 7. `ENC_MODE == 0x01` but no encryption key is configured on this receiver.
-8. The recovered `TOPIC_CRC32` (header field for plaintext, first 4 bytes of decrypted plaintext for encrypted) matches none of the topics this node has subscribed to.
+8. `ENC_MODE == 0x01` and the Poly1305 tag fails to authenticate the header (AAD) + ciphertext under the key — a wrong key or any tampering.
+9. The recovered `TOPIC_CRC32` (header field for plaintext, first 4 bytes of decrypted plaintext for encrypted) matches none of the topics this node has subscribed to.
 
 A receiver with replay protection enabled (a configured `replay_window`)
 additionally drops an `ENC_MODE == 0x01` datagram, **after** decryption, if
@@ -294,14 +299,15 @@ wire-validity rule — an unprotected receiver accepts the same datagram.
 For `ENCODING == PROTOBUF` packets, the receiver additionally MUST
 drop the body if:
 
-9. `PAYLOAD_LEN < 2` — body too short to carry a `SCHEMA_ID`.
-10. The `SCHEMA_ID` doesn't match any typed subscriber on the topic.
+10. `PAYLOAD_LEN < 2` — body too short to carry a `SCHEMA_ID`.
+11. The `SCHEMA_ID` doesn't match any typed subscriber on the topic.
 
 The C++ implementation surfaces (1)–(6) as a `DecodeError` enum
 (`TOO_SHORT`, `BAD_MAGIC`, `BAD_VERSION`, `UNKNOWN_ENCODING`,
-`UNKNOWN_ENC_MODE`, `LENGTH_MISMATCH`, `CIPHERTEXT_TOO_SHORT`); (7)–(10)
+`UNKNOWN_ENC_MODE`, `LENGTH_MISMATCH`, `CIPHERTEXT_TOO_SHORT`); (7)–(11)
 are post-decode filtering in `MulticastPubSub::on_packet_` /
-`MulticastPubSub::deliver_`. See `components/mpubsub/wire_format.h`.
+`MulticastPubSub::deliver_` (rule 8, AEAD authentication, in
+`handle_encrypted_`). See `components/mpubsub/wire_format.h`.
 
 ## 5. Sender requirements
 
@@ -340,13 +346,14 @@ A subscriber MUST:
 The following are **not** part of this protocol revision. A v2 may add
 them; if so it will bump `VERSION` to `0x02`.
 
-* **Forward secrecy.** The optional XXTEA-256 payload encryption (§3.3) is a
+* **Forward secrecy / per-peer identity.** The optional ChaCha20-Poly1305
+  payload encryption (§3.3) authenticates and encrypts under a single
   long-lived shared key, so an attacker who later learns the key can decrypt
-  previously-captured traffic. (Replay protection against non-key-holders
-  *is* available via the optional `replay_window`; see §3.3. Full
-  authenticated encryption is still out of scope — layer a real AEAD inside
-  the payload or run the protocol on an isolated/encrypted L2 such as
-  WireGuard.)
+  previously-captured traffic, and any key-holder can forge traffic.
+  (Confidentiality, strong authentication, and replay protection against
+  non-key-holders are all provided; see §3.3.) Per-sender keys and key
+  rotation are out of scope — run the protocol on an isolated/encrypted L2
+  such as WireGuard if you need them.
 * **MQTT-style wildcards.** Each subscription is one exact topic. Bridges
   (see [`examples/05_mqtt_bridge.yaml`](../examples/05_mqtt_bridge.yaml))
   can fan out wildcards on the broker side.

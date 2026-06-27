@@ -42,14 +42,15 @@ func fuzzSchema(tb testing.TB) *Schema {
 //  4. raw random short strings (the mutator will expand them).
 func FuzzDecodePacket(f *testing.F) {
 	// (1) a real plaintext datagram
-	plain, err := EncodePacket("home/test", []byte("hello"), encodingRaw, nil, 0, 0)
+	plain, err := EncodePacket("home/test", []byte("hello"), encodingRaw, nil, 0, nil)
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Add(plain)
 	// (2) a real encrypted datagram
 	key := DeriveKey("passphrase")
-	enc, err := EncodePacket("home/test", []byte("hello"), encodingRaw, key, 1_700_000_000, 0xABCDEF01)
+	enc, err := EncodePacket("home/test", []byte("hello"), encodingRaw, key, 1_700_000_000,
+		[]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
 	if err != nil {
 		f.Fatal(err)
 	}

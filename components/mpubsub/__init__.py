@@ -48,7 +48,7 @@ DEPENDENCIES = ["network"]
 # ~10KB cost of the API server. (A future upstream refactor splitting
 # api/proto.{h,cpp} into a leaf `api_proto` sub-component would let us
 # bring in only the protobuf primitives without the server runtime.)
-AUTO_LOAD = ["socket", "sensor", "xxtea"]
+AUTO_LOAD = ["socket", "sensor"]
 MULTI_CONF = True
 
 multicast_pubsub_ns = cg.esphome_ns.namespace("multicast_pubsub")
@@ -269,7 +269,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_HOPS, default=1): cv.int_range(min=1, max=255),
         cv.Optional(CONF_RETRANSMIT_COUNT, default=1): _retransmit_count_validator,
         cv.Optional(CONF_RETRANSMIT_DELAY, default="100ms"): cv.positive_time_period_milliseconds,
-        # Optional XXTEA-256 payload encryption. The user-supplied key string
+        # Optional ChaCha20-Poly1305 payload encryption. The user-supplied key string
         # is SHA-256'd to 32 bytes at codegen time -- same convention as
         # packet_transport's `encryption.key`.
         cv.Optional(CONF_ENCRYPTION): cv.Schema(
@@ -416,7 +416,7 @@ async def to_code(config):
     if CONF_ENCRYPTION in config:
         enc = config[CONF_ENCRYPTION]
         # Mirror packet_transport's hash_encryption_key(): SHA-256 the user
-        # passphrase to a deterministic 32-byte XXTEA-256 key.
+        # passphrase to a deterministic 32-byte ChaCha20-Poly1305 key.
         digest = list(hashlib.sha256(enc[CONF_KEY].encode()).digest())
         cg.add(var.set_encryption_key(digest))
         # Optional replay protection: wire up the freshness window and the

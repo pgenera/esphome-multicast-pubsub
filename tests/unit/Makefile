@@ -10,7 +10,7 @@ COMP := ../../components/mpubsub
 
 .PHONY: all clean
 all: topic_hash_test wire_format_test wire_format_test_san topic_hash_test_san \
-     replay_guard_test replay_guard_test_san
+     replay_guard_test replay_guard_test_san chacha_test chacha_test_san
 
 # DynamicMessage / DynamicReader are exercised end-to-end via the host
 # integration build (tests/typed_publisher.yaml's dynamic-publish lambda)
@@ -21,8 +21,15 @@ topic_hash_test: topic_hash_main.cpp $(COMP)/topic_hash.cpp $(COMP)/topic_hash.h
                  $(COMP)/sha256.cpp $(COMP)/sha256.h
 	$(CXX) $(CXXFLAGS) -I$(COMP) -o $@ topic_hash_main.cpp $(COMP)/topic_hash.cpp $(COMP)/sha256.cpp
 
-wire_format_test: wire_format_main.cpp $(COMP)/wire_format.cpp $(COMP)/wire_format.h
+wire_format_test: wire_format_main.cpp $(COMP)/wire_format.cpp $(COMP)/wire_format.h $(COMP)/chacha20poly1305.h
 	$(CXX) $(CXXFLAGS) -I$(COMP) -o $@ wire_format_main.cpp $(COMP)/wire_format.cpp
+
+# Vendored ChaCha20-Poly1305: self-checking harness (RFC 8439 vectors).
+chacha_test: chacha_main.cpp $(COMP)/chacha20poly1305.cpp $(COMP)/chacha20poly1305.h
+	$(CXX) $(CXXFLAGS) -I$(COMP) -o $@ chacha_main.cpp $(COMP)/chacha20poly1305.cpp
+
+chacha_test_san: chacha_main.cpp $(COMP)/chacha20poly1305.cpp $(COMP)/chacha20poly1305.h
+	$(CXX) $(CXXFLAGS) $(SAN_FLAGS) -I$(COMP) -o $@ chacha_main.cpp $(COMP)/chacha20poly1305.cpp
 
 # Sanitizer variants -- same source, ASan + UBSan added. Used by the
 # fuzzing tests to catch silent UB the regular harness wouldn't show.
@@ -42,4 +49,4 @@ replay_guard_test_san: replay_guard_main.cpp $(COMP)/replay_guard.h
 
 clean:
 	rm -f topic_hash_test wire_format_test topic_hash_test_san wire_format_test_san \
-	      replay_guard_test replay_guard_test_san
+	      replay_guard_test replay_guard_test_san chacha_test chacha_test_san
