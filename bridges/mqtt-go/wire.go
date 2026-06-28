@@ -53,8 +53,11 @@ func DeriveKey(passphrase string) []byte {
 	return h[:]
 }
 
+// xxteaMX matches esphome::xxtea (the authoritative on-device cipher): a
+// 256-bit key with index k[(p ^ e) & 7] and e = sum>>2, not the 128-bit-style
+// k[(p & 3) ^ e]. The bridge must match it to interoperate with devices.
 func xxteaMX(z, y, sum uint32, p, e int, k []uint32) uint32 {
-	return ((z>>5 ^ y<<2) + (y>>3 ^ z<<4)) ^ ((sum ^ y) + (k[(p&3)^e] ^ z))
+	return ((z>>5 ^ y<<2) + (y>>3 ^ z<<4)) ^ ((sum ^ y) + (k[(p^e)&7] ^ z))
 }
 
 // xxteaEncrypt encrypts `words` in place using `key` (8 uint32s).
@@ -68,7 +71,7 @@ func xxteaEncrypt(words []uint32, key []uint32) {
 	z := words[n-1]
 	for r := 0; r < rounds; r++ {
 		sum += xxteaDelta
-		e := int((sum >> 2) & 3)
+		e := int(sum >> 2)
 		var y uint32
 		for p := 0; p < n-1; p++ {
 			y = words[p+1]
@@ -91,7 +94,7 @@ func xxteaDecrypt(words []uint32, key []uint32) {
 	sum := uint32(rounds) * xxteaDelta
 	y := words[0]
 	for r := 0; r < rounds; r++ {
-		e := int((sum >> 2) & 3)
+		e := int(sum >> 2)
 		var z uint32
 		for p := n - 1; p > 0; p-- {
 			z = words[p-1]

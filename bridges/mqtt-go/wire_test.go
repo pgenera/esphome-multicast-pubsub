@@ -119,7 +119,7 @@ func TestEncryptedKnownVectorMatchesPythonReference(t *testing.T) {
 	// Pinned with a fixed timestamp + nonce so the ciphertext is deterministic.
 	// Regenerate via tests/unit/reference.py encode(..., timestamp=1700000000,
 	// nonce=0xDEADBEEF) if the wire layout ever changes.
-	expected, _ := hex.DecodeString("4d5001000000000005000100a53deab5b768470c96f9adaf39cedcdd10b98296")
+	expected, _ := hex.DecodeString("4d5001000000000005000100c16a7834e0076941935c7a00fba865daf8e76f51")
 	key := DeriveKey("hunter2")
 	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, key, 1_700_000_000, 0xDEADBEEF)
 	if err != nil {

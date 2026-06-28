@@ -72,16 +72,19 @@ def topic_crc32(topic: str) -> int:
 # ----------------------------------------------------------------------------
 # XXTEA-256
 #
-# Block-cipher operating in place on a vector of uint32_t words. Matches the
-# reference algorithm used by esphome::xxtea (which packet_transport reuses).
-# 256-bit key = 8 uint32 words.
+# Block-cipher operating in place on a vector of uint32_t words. Byte-for-byte
+# compatible with ``esphome::xxtea`` (which packet_transport reuses and which
+# devices actually run on the wire): 256-bit key = 8 uint32 words, key index
+# ``k[(p ^ e) & 7]`` with ``e = sum >> 2`` (NOT the 128-bit-style
+# ``k[(p & 3) ^ e]``). The C++ implementation is authoritative here -- the
+# bridge must match it to interoperate with devices.
 # ----------------------------------------------------------------------------
 
 _DELTA = 0x9E3779B9
 
 
 def _xxtea_mx(z: int, y: int, sum_: int, p: int, e: int, k: list[int]) -> int:
-    return (((z >> 5 ^ y << 2) + (y >> 3 ^ z << 4)) ^ ((sum_ ^ y) + (k[(p & 3) ^ e] ^ z))) & 0xFFFFFFFF
+    return (((z >> 5 ^ y << 2) + (y >> 3 ^ z << 4)) ^ ((sum_ ^ y) + (k[(p ^ e) & 7] ^ z))) & 0xFFFFFFFF
 
 
 def xxtea_encrypt(words: list[int], key: list[int]) -> None:
@@ -94,7 +97,7 @@ def xxtea_encrypt(words: list[int], key: list[int]) -> None:
     z = words[n - 1]
     for _ in range(rounds):
         sum_ = (sum_ + _DELTA) & 0xFFFFFFFF
-        e = (sum_ >> 2) & 3
+        e = sum_ >> 2
         for p in range(n - 1):
             y = words[p + 1]
             words[p] = (words[p] + _xxtea_mx(z, y, sum_, p, e, key)) & 0xFFFFFFFF
@@ -113,7 +116,7 @@ def xxtea_decrypt(words: list[int], key: list[int]) -> None:
     sum_ = (rounds * _DELTA) & 0xFFFFFFFF
     y = words[0]
     for _ in range(rounds):
-        e = (sum_ >> 2) & 3
+        e = sum_ >> 2
         for p in range(n - 1, 0, -1):
             z = words[p - 1]
             words[p] = (words[p] - _xxtea_mx(z, y, sum_, p, e, key)) & 0xFFFFFFFF
