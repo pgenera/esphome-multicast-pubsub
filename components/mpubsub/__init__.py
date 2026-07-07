@@ -333,10 +333,13 @@ def _final_validate(config):
             )
 
     # Replay protection needs a clock to measure freshness against: a
-    # replay_window without a time_id has nothing to check the timestamp
-    # against, so the receiver would fail closed and drop every packet.
+    # non-zero replay_window without a time_id has nothing to check the
+    # timestamp against, so the receiver would fail closed and drop every
+    # packet. `replay_window: 0s` explicitly disables the check, so it needs
+    # no clock.
     enc = config.get(CONF_ENCRYPTION)
-    if enc and CONF_REPLAY_WINDOW in enc and CONF_TIME_ID not in enc:
+    window = enc.get(CONF_REPLAY_WINDOW) if enc else None
+    if window is not None and window.total_seconds > 0 and CONF_TIME_ID not in enc:
         raise cv.Invalid(
             "encryption `replay_window` requires `time_id:` pointing at a "
             "`time:` component (the receiver measures packet freshness "
