@@ -13,7 +13,8 @@ This exercises the real component decrypt path end-to-end on the socket
 platform -- the path a unit test of the wire format alone can't reach, and
 exactly where the socket-vs-ESP8266 consolidation bug hid. It is
 cipher-agnostic: `reference.encode` and the rebuilt binary move in lockstep,
-so the same test covers XXTEA (main) and ChaCha20-Poly1305 (the AEAD branch).
+so the same test covers whatever cipher the component ships (currently
+ChaCha20-Poly1305 AEAD, RFC 8439).
 
 Replay protection itself (the freshness window) is *not* exercised here: the
 host platform has no synchronized clock, so a replay-checking receiver fails
