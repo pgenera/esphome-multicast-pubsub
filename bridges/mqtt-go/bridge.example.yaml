@@ -26,7 +26,7 @@ mpubsub:
   # bridge SHA-256's this passphrase to the 32-byte AEAD key.
   # encryption:
   #   key: "any-length passphrase"
-  #   replay_window: 30s       # drop packets older/newer than this; omit to disable
+  #   replay_window: 30s       # drop packets older/newer than this; 0s (or omit) disables
 
 bridges:
   # Take temperature published over MQTT and rebroadcast on multicast under

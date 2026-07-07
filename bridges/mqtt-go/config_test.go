@@ -91,6 +91,20 @@ func TestReplayWindowParsed(t *testing.T) {
 	}
 }
 
+func TestReplayWindowZeroDisablesNoKeyNeeded(t *testing.T) {
+	// 0s explicitly disables replay protection (matching the ESPHome
+	// component), so it validates even without an encryption key and leaves
+	// the guard off.
+	c := minimalConfig()
+	c.MPubsub.Encryption.ReplayWindow = "0s"
+	if err := mustValidate(t, c); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.MPubsub.ReplayWindowSeconds != 0 {
+		t.Errorf("ReplayWindowSeconds = %d, want 0 (disabled)", c.MPubsub.ReplayWindowSeconds)
+	}
+}
+
 func TestReplayWindowNeedsKey(t *testing.T) {
 	c := minimalConfig()
 	c.MPubsub.Encryption.ReplayWindow = "30s"

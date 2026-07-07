@@ -196,13 +196,17 @@ func (c *Config) applyDefaults() error {
 			return fmt.Errorf("mpubsub.encryption.replay_window %q: %w",
 				c.MPubsub.Encryption.ReplayWindow, err)
 		}
-		if d <= 0 {
-			return fmt.Errorf("mpubsub.encryption.replay_window must be > 0 (got %s)", d)
+		if d < 0 {
+			return fmt.Errorf("mpubsub.encryption.replay_window must be >= 0 (got %s)", d)
 		}
-		if len(c.MPubsub.EncryptionKey) == 0 {
-			return fmt.Errorf("mpubsub.encryption.replay_window requires encryption.key")
+		// 0s explicitly disables replay protection (matches the ESPHome
+		// component), so it needs neither a key nor a clock reference.
+		if d > 0 {
+			if len(c.MPubsub.EncryptionKey) == 0 {
+				return fmt.Errorf("mpubsub.encryption.replay_window requires encryption.key")
+			}
+			c.MPubsub.ReplayWindowSeconds = uint32(d.Seconds())
 		}
-		c.MPubsub.ReplayWindowSeconds = uint32(d.Seconds())
 	}
 	if !c.JSONTranslation {
 		if len(c.Schemas) > 0 {
