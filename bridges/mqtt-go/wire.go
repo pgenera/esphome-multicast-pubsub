@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"net"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
@@ -23,108 +25,30 @@ const (
 	encodingProto byte = 0x01
 
 	// EncMode lives in header byte 10.
-	encModeNone  byte = 0x00
-	encModeXXTEA byte = 0x01
+	encModeNone byte = 0x00
+	encModeAEAD byte = 0x01 // ChaCha20-Poly1305 (RFC 8439)
 
-	// XXTEA-256 constants.
-	xxteaDelta uint32 = 0x9E3779B9
-
-	// Bytes prepended to the XXTEA plaintext, ahead of the user payload:
-	// TOPIC_CRC32 (4) + TIMESTAMP (4) + NONCE (4). The CRC is the integrity
-	// tag; the timestamp + nonce feed receiver-side replay rejection.
-	xxteaPrefixLen = 12
+	// AEAD sizes (RFC 8439).
+	aeadNonceLen = chacha20poly1305.NonceSize // 12
+	aeadTagLen   = chacha20poly1305.Overhead  // 16
+	// Bytes prepended to the AEAD plaintext (encrypted + authenticated),
+	// ahead of the user payload: TOPIC_CRC32 (4) + TIMESTAMP (4).
+	aeadPrefixLen = 8
 )
 
-// XXTEACiphertextLen is the on-wire ciphertext length for a plaintext mpubsub
-// payload of `plaintextLen` bytes. The plaintext is `[crc32 || timestamp ||
-// nonce] (12 bytes) || payload`, zero-padded up to a multiple of 4 bytes
-// (XXTEA word size). The 12-byte prefix already clears XXTEA's 2-word (8-byte)
-// minimum, so no separate floor is needed.
-func XXTEACiphertextLen(plaintextLen int) int {
-	needed := plaintextLen + xxteaPrefixLen
-	return (needed + 3) &^ 3
+// AEADBodyLen is the on-wire encrypted-body length for a payload of
+// `payloadLen` bytes: the 12-byte nonce, the ciphertext (8-byte prefix +
+// payload, no padding -- ChaCha20 is a stream cipher), and the 16-byte tag.
+func AEADBodyLen(payloadLen int) int {
+	return aeadNonceLen + aeadPrefixLen + payloadLen + aeadTagLen
 }
 
-// DeriveKey hashes a passphrase to a 32-byte XXTEA-256 key. Matches the
+// DeriveKey hashes a passphrase to a 32-byte AEAD key. Matches the
 // `hashlib.sha256(key).digest()` convention used by ESPHome's
 // packet_transport component (which mpubsub's C++ side reuses).
 func DeriveKey(passphrase string) []byte {
 	h := sha256.Sum256([]byte(passphrase))
 	return h[:]
-}
-
-// xxteaMX matches esphome::xxtea (the authoritative on-device cipher): a
-// 256-bit key with index k[(p ^ e) & 7] and e = sum>>2, not the 128-bit-style
-// k[(p & 3) ^ e]. The bridge must match it to interoperate with devices.
-func xxteaMX(z, y, sum uint32, p, e int, k []uint32) uint32 {
-	return ((z>>5 ^ y<<2) + (y>>3 ^ z<<4)) ^ ((sum ^ y) + (k[(p^e)&7] ^ z))
-}
-
-// xxteaEncrypt encrypts `words` in place using `key` (8 uint32s).
-func xxteaEncrypt(words []uint32, key []uint32) {
-	n := len(words)
-	if n < 2 {
-		return
-	}
-	rounds := 6 + 52/n
-	var sum uint32
-	z := words[n-1]
-	for r := 0; r < rounds; r++ {
-		sum += xxteaDelta
-		e := int(sum >> 2)
-		var y uint32
-		for p := 0; p < n-1; p++ {
-			y = words[p+1]
-			words[p] += xxteaMX(z, y, sum, p, e, key)
-			z = words[p]
-		}
-		y = words[0]
-		words[n-1] += xxteaMX(z, y, sum, n-1, e, key)
-		z = words[n-1]
-	}
-}
-
-// xxteaDecrypt decrypts `words` in place using `key` (8 uint32s).
-func xxteaDecrypt(words []uint32, key []uint32) {
-	n := len(words)
-	if n < 2 {
-		return
-	}
-	rounds := 6 + 52/n
-	sum := uint32(rounds) * xxteaDelta
-	y := words[0]
-	for r := 0; r < rounds; r++ {
-		e := int(sum >> 2)
-		var z uint32
-		for p := n - 1; p > 0; p-- {
-			z = words[p-1]
-			words[p] -= xxteaMX(z, y, sum, p, e, key)
-			y = words[p]
-		}
-		z = words[n-1]
-		words[0] -= xxteaMX(z, y, sum, 0, e, key)
-		y = words[0]
-		sum -= xxteaDelta
-	}
-}
-
-func bytesToWordsLE(b []byte) []uint32 {
-	if len(b)%4 != 0 {
-		return nil
-	}
-	out := make([]uint32, len(b)/4)
-	for i := range out {
-		out[i] = binary.LittleEndian.Uint32(b[i*4 : i*4+4])
-	}
-	return out
-}
-
-func wordsToBytesLE(words []uint32) []byte {
-	out := make([]byte, len(words)*4)
-	for i, w := range words {
-		binary.LittleEndian.PutUint32(out[i*4:i*4+4], w)
-	}
-	return out
 }
 
 // Scope is the low nibble of the IPv6 multicast scope field (RFC 4291 §2.7).
@@ -167,64 +91,65 @@ func TopicCRC32(topic string) uint32 {
 	return crc32.ChecksumIEEE([]byte(topic))
 }
 
-// EncodePacket builds the 12-byte header + payload datagram. When `key` is
-// non-nil (32 bytes), the body is XXTEA-256 ciphertext over
-// `[crc32 || timestamp || nonce] || payload || zero pad`; the cleartext
-// TOPIC_CRC32 field is zeroed and PAY_LEN holds the plaintext length.
-//
-// `timestamp` (unix epoch seconds) and `nonce` feed the receiver's replay
-// rejection and are ignored for plaintext (key == nil). A timestamp of 0
-// marks "the sender had no synchronized clock" and is dropped by a
-// replay-checking receiver.
-func EncodePacket(topic string, payload []byte, encoding byte, key []byte, timestamp, nonce uint32) ([]byte, error) {
-	if encoding != encodingRaw && encoding != encodingProto {
-		return nil, fmt.Errorf("unknown encoding 0x%02x", encoding)
-	}
-	crc := TopicCRC32(topic)
-	var (
-		body    []byte
-		encMode byte
-		hdrCRC  uint32
-	)
-	if key == nil {
-		if len(payload) > maxPayload {
-			return nil, fmt.Errorf("payload too large (%d > %d)", len(payload), maxPayload)
-		}
-		body = payload
-		encMode = encModeNone
-		hdrCRC = crc
-	} else {
-		if len(key) != 32 {
-			return nil, fmt.Errorf("xxtea key must be 32 bytes, got %d", len(key))
-		}
-		clen := XXTEACiphertextLen(len(payload))
-		if headerLen+clen > maxDatagram {
-			return nil, fmt.Errorf("encrypted payload too large (%d -> %d-byte ciphertext)",
-				len(payload), clen)
-		}
-		plain := make([]byte, clen)
-		// 12-byte prefix: crc | timestamp | nonce, all little-endian.
-		binary.LittleEndian.PutUint32(plain[0:4], crc)
-		binary.LittleEndian.PutUint32(plain[4:8], timestamp)
-		binary.LittleEndian.PutUint32(plain[8:12], nonce)
-		copy(plain[xxteaPrefixLen:], payload)
-		// plain[12+len(payload):] is already zero (Go zero-initializes slices).
-		words := bytesToWordsLE(plain)
-		xxteaEncrypt(words, bytesToWordsLE(key))
-		body = wordsToBytesLE(words)
-		encMode = encModeXXTEA
-		hdrCRC = 0
-	}
-	buf := make([]byte, headerLen+len(body))
+func writeHeader(buf []byte, encoding byte, hdrCRC uint32, payloadLen int, encMode byte) {
 	buf[0] = wireMagic0
 	buf[1] = wireMagic1
 	buf[2] = wireVersion
 	buf[3] = encoding
 	binary.LittleEndian.PutUint32(buf[4:8], hdrCRC)
-	binary.LittleEndian.PutUint16(buf[8:10], uint16(len(payload)))
+	binary.LittleEndian.PutUint16(buf[8:10], uint16(payloadLen))
 	buf[10] = encMode
-	// buf[11] reserved, already zero.
-	copy(buf[headerLen:], body)
+	buf[11] = 0 // reserved
+}
+
+// EncodePacket builds the 12-byte header + body datagram. When `key` is
+// non-nil (32 bytes), the body is ChaCha20-Poly1305:
+// `[AEAD_NONCE (12)] || ciphertext || [TAG (16)]` where the ciphertext
+// encrypts `[crc32 (4)] || [timestamp (4)] || payload` and the 12-byte
+// cleartext header is the AAD; the cleartext TOPIC_CRC32 field is zeroed and
+// PAY_LEN holds the plaintext length.
+//
+// `timestamp` (unix epoch seconds) feeds the receiver's freshness check and
+// `nonce` (the 12-byte AEAD nonce) is its per-message identity. Both are
+// ignored for plaintext (key == nil). A timestamp of 0 marks "the sender had
+// no synchronized clock" and is dropped by a replay-checking receiver.
+func EncodePacket(topic string, payload []byte, encoding byte, key []byte, timestamp uint32, nonce []byte) ([]byte, error) {
+	if encoding != encodingRaw && encoding != encodingProto {
+		return nil, fmt.Errorf("unknown encoding 0x%02x", encoding)
+	}
+	crc := TopicCRC32(topic)
+	if key == nil {
+		if len(payload) > maxPayload {
+			return nil, fmt.Errorf("payload too large (%d > %d)", len(payload), maxPayload)
+		}
+		buf := make([]byte, headerLen+len(payload))
+		writeHeader(buf, encoding, crc, len(payload), encModeNone)
+		copy(buf[headerLen:], payload)
+		return buf, nil
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("aead key must be 32 bytes, got %d", len(key))
+	}
+	if len(nonce) != aeadNonceLen {
+		return nil, fmt.Errorf("aead nonce must be %d bytes, got %d", aeadNonceLen, len(nonce))
+	}
+	if headerLen+AEADBodyLen(len(payload)) > maxDatagram {
+		return nil, fmt.Errorf("encrypted payload too large (%d -> %d-byte body)",
+			len(payload), AEADBodyLen(len(payload)))
+	}
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, headerLen+aeadNonceLen, headerLen+AEADBodyLen(len(payload)))
+	writeHeader(buf, encoding, 0, len(payload), encModeAEAD)
+	copy(buf[headerLen:], nonce)
+	plaintext := make([]byte, aeadPrefixLen+len(payload))
+	binary.LittleEndian.PutUint32(plaintext[0:4], crc)
+	binary.LittleEndian.PutUint32(plaintext[4:8], timestamp)
+	copy(plaintext[aeadPrefixLen:], payload)
+	// Seal appends ciphertext||tag to buf; AAD is the 12-byte header.
+	buf = aead.Seal(buf, nonce, plaintext, buf[0:headerLen])
 	return buf, nil
 }
 
@@ -236,27 +161,30 @@ type DecodedPacket struct {
 	WasEncrypted bool
 	Payload      []byte // decrypted plaintext if WasEncrypted, raw body otherwise
 	// Timestamp and Nonce are the replay fields recovered from an encrypted
-	// packet's ciphertext prefix; both are 0 for plaintext packets.
+	// packet; both are 0 for plaintext. Nonce is the low 32 bits of the
+	// (random) AEAD nonce, used as the de-dup identity.
 	Timestamp uint32
 	Nonce     uint32
 }
 
 var (
-	errTooShort          = errors.New("datagram too short")
-	errBadMagic          = errors.New("bad magic")
-	errBadVersion        = errors.New("unsupported version")
-	errUnknownEncoding   = errors.New("unknown encoding")
-	errLengthMismatch    = errors.New("length mismatch")
-	errUnknownEncMode    = errors.New("unknown enc_mode")
-	errCiphertextTooShort = errors.New("ciphertext too short")
-	errEncryptedNoKey    = errors.New("encrypted packet but no key configured")
+	errTooShort        = errors.New("datagram too short")
+	errBadMagic        = errors.New("bad magic")
+	errBadVersion      = errors.New("unsupported version")
+	errUnknownEncoding = errors.New("unknown encoding")
+	errLengthMismatch  = errors.New("length mismatch")
+	errUnknownEncMode  = errors.New("unknown enc_mode")
+	errBodyLenMismatch = errors.New("encrypted body length mismatch")
+	errEncryptedNoKey  = errors.New("encrypted packet but no key configured")
+	errAuthFailed      = errors.New("AEAD authentication failed (wrong key or tampered packet)")
 )
 
 // DecodePacket parses a datagram. When the packet is encrypted (ENC_MODE ==
-// XXTEA), `key` must be the 32-byte XXTEA-256 key; the recovered topic CRC
-// comes from the first 4 bytes of the decrypted plaintext and Payload is
-// the plaintext slice. WasEncrypted indicates which path produced the
-// result so callers can enforce per-route "require_encryption" policies.
+// AEAD), `key` must be the 32-byte ChaCha20-Poly1305 key; the body is
+// authenticated and decrypted, the topic CRC + timestamp come from the
+// decrypted prefix, and Payload is the plaintext slice. WasEncrypted
+// indicates which path produced the result so callers can enforce per-route
+// "require_encryption" policies.
 func DecodePacket(data []byte, key []byte) (*DecodedPacket, error) {
 	if len(data) < headerLen {
 		return nil, errTooShort
@@ -272,37 +200,40 @@ func DecodePacket(data []byte, key []byte) (*DecodedPacket, error) {
 		return nil, errUnknownEncoding
 	}
 	encMode := data[10]
-	if encMode != encModeNone && encMode != encModeXXTEA {
+	if encMode != encModeNone && encMode != encModeAEAD {
 		return nil, errUnknownEncMode
 	}
 	hdrCRC := binary.LittleEndian.Uint32(data[4:8])
 	payloadLen := binary.LittleEndian.Uint16(data[8:10])
 	// data[11] reserved; receivers ignore for forward-compat.
-	if encMode == encModeXXTEA {
-		expected := headerLen + XXTEACiphertextLen(int(payloadLen))
-		if len(data) != expected {
-			return nil, errCiphertextTooShort
+	if encMode == encModeAEAD {
+		if len(data) != headerLen+AEADBodyLen(int(payloadLen)) {
+			return nil, errBodyLenMismatch
 		}
 		if key == nil {
 			return nil, errEncryptedNoKey
 		}
 		if len(key) != 32 {
-			return nil, fmt.Errorf("xxtea key must be 32 bytes, got %d", len(key))
+			return nil, fmt.Errorf("aead key must be 32 bytes, got %d", len(key))
 		}
-		words := bytesToWordsLE(data[headerLen:])
-		xxteaDecrypt(words, bytesToWordsLE(key))
-		plain := wordsToBytesLE(words)
-		crc := binary.LittleEndian.Uint32(plain[0:4])
-		ts := binary.LittleEndian.Uint32(plain[4:8])
-		nonce := binary.LittleEndian.Uint32(plain[8:12])
+		aead, err := chacha20poly1305.New(key)
+		if err != nil {
+			return nil, err
+		}
+		nonce := data[headerLen : headerLen+aeadNonceLen]
+		sealed := data[headerLen+aeadNonceLen:] // ciphertext || tag
+		plain, err := aead.Open(nil, nonce, sealed, data[0:headerLen])
+		if err != nil {
+			return nil, errAuthFailed
+		}
 		return &DecodedPacket{
-			TopicCRC:     crc,
+			TopicCRC:     binary.LittleEndian.Uint32(plain[0:4]),
 			Encoding:     enc,
 			EncMode:      encMode,
 			WasEncrypted: true,
-			Payload:      plain[xxteaPrefixLen : xxteaPrefixLen+int(payloadLen)],
-			Timestamp:    ts,
-			Nonce:        nonce,
+			Payload:      plain[aeadPrefixLen:],
+			Timestamp:    binary.LittleEndian.Uint32(plain[4:8]),
+			Nonce:        binary.LittleEndian.Uint32(nonce[0:4]),
 		}, nil
 	}
 	if int(payloadLen)+headerLen != len(data) {

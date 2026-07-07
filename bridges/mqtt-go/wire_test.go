@@ -6,8 +6,11 @@ import (
 	"testing"
 )
 
+// A fixed 12-byte nonce for deterministic encodings in tests.
+var testNonce = []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+
 func TestEncodeDecodePlaintextRoundtrip(t *testing.T) {
-	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, nil, 0, 0)
+	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, nil, 0, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -29,7 +32,7 @@ func TestEncodeDecodePlaintextRoundtrip(t *testing.T) {
 func TestEncodeDecodeEncryptedRoundtrip(t *testing.T) {
 	key := DeriveKey("hunter2")
 	payload := []byte("secret message")
-	pkt, err := EncodePacket("home/x", payload, encodingRaw, key, 1_700_000_000, 0xDEADBEEF)
+	pkt, err := EncodePacket("home/x", payload, encodingRaw, key, 1_700_000_000, testNonce)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -37,9 +40,8 @@ func TestEncodeDecodeEncryptedRoundtrip(t *testing.T) {
 	if !bytes.Equal(pkt[4:8], []byte{0, 0, 0, 0}) {
 		t.Errorf("cleartext header CRC leaked: %x", pkt[4:8])
 	}
-	// Byte 10 (ENC_MODE) = XXTEA.
-	if pkt[10] != encModeXXTEA {
-		t.Errorf("enc_mode byte = %x, want %x", pkt[10], encModeXXTEA)
+	if pkt[10] != encModeAEAD {
+		t.Errorf("enc_mode byte = %x, want %x", pkt[10], encModeAEAD)
 	}
 	d, err := DecodePacket(pkt, key)
 	if err != nil {
@@ -54,31 +56,35 @@ func TestEncodeDecodeEncryptedRoundtrip(t *testing.T) {
 	if !d.WasEncrypted {
 		t.Errorf("WasEncrypted should be true")
 	}
-	// The replay fields survive the ciphertext roundtrip.
-	if d.Timestamp != 1_700_000_000 || d.Nonce != 0xDEADBEEF {
-		t.Errorf("replay fields mismatch: ts=%d nonce=%08x", d.Timestamp, d.Nonce)
+	if d.Timestamp != 1_700_000_000 {
+		t.Errorf("timestamp = %d, want 1700000000", d.Timestamp)
 	}
 }
 
-func TestEncryptedWrongKeyDoesNotRecoverCRC(t *testing.T) {
+func TestEncryptedWrongKeyFailsAuth(t *testing.T) {
 	key := DeriveKey("right")
 	bad := DeriveKey("wrong")
-	pkt, err := EncodePacket("home/x", []byte("payload"), encodingRaw, key, 1_700_000_000, 1)
+	pkt, err := EncodePacket("home/x", []byte("payload"), encodingRaw, key, 1_700_000_000, testNonce)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := DecodePacket(pkt, bad)
-	if err != nil {
-		t.Fatalf("decode: %v", err) // shouldn't fail at decode level
+	if _, err := DecodePacket(pkt, bad); err == nil {
+		t.Error("wrong key should fail AEAD authentication")
 	}
-	if d.TopicCRC == TopicCRC32("home/x") {
-		t.Errorf("wrong key recovered the correct CRC -- integrity check broken")
+}
+
+func TestTamperFailsAuth(t *testing.T) {
+	key := DeriveKey("k")
+	pkt, _ := EncodePacket("home/x", []byte("value"), encodingRaw, key, 1_700_000_000, testNonce)
+	pkt[len(pkt)-1] ^= 0x01 // flip a tag bit
+	if _, err := DecodePacket(pkt, key); err == nil {
+		t.Error("tampered packet should fail authentication")
 	}
 }
 
 func TestEncryptedNoKeyRejected(t *testing.T) {
 	key := DeriveKey("k")
-	pkt, _ := EncodePacket("t", []byte("x"), encodingRaw, key, 1_700_000_000, 1)
+	pkt, _ := EncodePacket("t", []byte("x"), encodingRaw, key, 1_700_000_000, testNonce)
 	if _, err := DecodePacket(pkt, nil); err == nil {
 		t.Error("expected error decoding encrypted packet without key")
 	}
@@ -86,13 +92,13 @@ func TestEncryptedNoKeyRejected(t *testing.T) {
 
 func TestEncryptedEmptyPayload(t *testing.T) {
 	key := DeriveKey("k")
-	pkt, err := EncodePacket("t", nil, encodingRaw, key, 1_700_000_000, 1)
+	pkt, err := EncodePacket("t", nil, encodingRaw, key, 1_700_000_000, testNonce)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 12 header + 12 prefix-only ciphertext (crc+ts+nonce, no payload) = 24.
-	if len(pkt) != 24 {
-		t.Errorf("len = %d, want 24", len(pkt))
+	// 12 header + 36 body (12 nonce + 8 prefix + 0 payload + 16 tag) = 48.
+	if len(pkt) != 48 {
+		t.Errorf("len = %d, want 48", len(pkt))
 	}
 	d, err := DecodePacket(pkt, key)
 	if err != nil {
@@ -103,25 +109,30 @@ func TestEncryptedEmptyPayload(t *testing.T) {
 	}
 }
 
+func TestBadNonceLengthRejected(t *testing.T) {
+	key := DeriveKey("k")
+	if _, err := EncodePacket("t", []byte("x"), encodingRaw, key, 1, []byte("short")); err == nil {
+		t.Error("expected error on wrong nonce length")
+	}
+}
+
 func TestUnknownEncModeRejected(t *testing.T) {
-	pkt, _ := EncodePacket("t", nil, encodingRaw, nil, 0, 0)
+	pkt, _ := EncodePacket("t", nil, encodingRaw, nil, 0, nil)
 	pkt[10] = 0x7F
 	if _, err := DecodePacket(pkt, nil); err == nil {
 		t.Error("expected error on unknown enc_mode")
 	}
 }
 
-// Pinned known-answer test: the same passphrase + topic + payload that
-// tests/unit/reference.py produces must be byte-for-byte identical to the
-// Go encoding. Locks the Go XXTEA and packet layout to the Python wire
-// reference (which is the source of truth that C++ also matches).
+// Pinned known-answer test: the same passphrase + topic + payload + nonce that
+// tests/unit/reference.py produces must be byte-for-byte identical to the Go
+// encoding. Locks the Go AEAD and packet layout to the Python wire reference
+// (which the C++ side also matches, both being RFC 8439).
 func TestEncryptedKnownVectorMatchesPythonReference(t *testing.T) {
-	// Pinned with a fixed timestamp + nonce so the ciphertext is deterministic.
-	// Regenerate via tests/unit/reference.py encode(..., timestamp=1700000000,
-	// nonce=0xDEADBEEF) if the wire layout ever changes.
-	expected, _ := hex.DecodeString("4d5001000000000005000100c16a7834e0076941935c7a00fba865daf8e76f51")
+	expected, _ := hex.DecodeString(
+		"4d5001000000000005000100000102030405060708090a0b70f08085036261950d7497b37a76184b4659c2e378ab6352115516ec59")
 	key := DeriveKey("hunter2")
-	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, key, 1_700_000_000, 0xDEADBEEF)
+	pkt, err := EncodePacket("home/x", []byte("hello"), encodingRaw, key, 1_700_000_000, testNonce)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,15 +141,15 @@ func TestEncryptedKnownVectorMatchesPythonReference(t *testing.T) {
 	}
 }
 
-func TestXXTEACiphertextLen(t *testing.T) {
+func TestAEADBodyLen(t *testing.T) {
 	cases := []struct {
 		in, out int
 	}{
-		{0, 12}, {1, 16}, {3, 16}, {4, 16}, {5, 20}, {8, 20}, {9, 24}, {100, 112},
+		{0, 36}, {1, 37}, {5, 41}, {100, 136},
 	}
 	for _, c := range cases {
-		if got := XXTEACiphertextLen(c.in); got != c.out {
-			t.Errorf("XXTEACiphertextLen(%d) = %d, want %d", c.in, got, c.out)
+		if got := AEADBodyLen(c.in); got != c.out {
+			t.Errorf("AEADBodyLen(%d) = %d, want %d", c.in, got, c.out)
 		}
 	}
 }

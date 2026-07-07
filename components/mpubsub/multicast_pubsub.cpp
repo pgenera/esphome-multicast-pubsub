@@ -7,70 +7,82 @@
 #include <cstdio>
 #include <cstring>
 
-#include "esphome/components/xxtea/xxtea.h"
+#include "chacha20poly1305.h"
 #include "esphome/core/log.h"
 
 namespace esphome::multicast_pubsub {
 
 static const char *const TAG = "mpubsub";
 
-// Build the XXTEA plaintext -- [crc || timestamp || nonce] prefix, then the
-// payload, then zero pad -- and encrypt it in place. Shared by both platform
-// publish() paths so the prefix layout lives in exactly one place.
-void MulticastPubSub::encrypt_body_(uint8_t *body, size_t body_len, uint32_t crc,
-                                    std::span<const uint8_t> payload) {
-  uint32_t ts = this->replay_timestamp_();
-  uint32_t nonce = random_uint32();
-  // 12-byte prefix, all little-endian: crc(4) | timestamp(4) | nonce(4).
-  body[0] = uint8_t(crc);
-  body[1] = uint8_t(crc >> 8);
-  body[2] = uint8_t(crc >> 16);
-  body[3] = uint8_t(crc >> 24);
-  body[4] = uint8_t(ts);
-  body[5] = uint8_t(ts >> 8);
-  body[6] = uint8_t(ts >> 16);
-  body[7] = uint8_t(ts >> 24);
-  body[8] = uint8_t(nonce);
-  body[9] = uint8_t(nonce >> 8);
-  body[10] = uint8_t(nonce >> 16);
-  body[11] = uint8_t(nonce >> 24);
-  std::memcpy(body + XXTEA_PREFIX_LEN, payload.data(), payload.size());
-  std::memset(body + XXTEA_PREFIX_LEN + payload.size(), 0, body_len - XXTEA_PREFIX_LEN - payload.size());
-  xxtea::encrypt(reinterpret_cast<uint32_t *>(body), body_len / 4,
-                 reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
+static inline void store_u32le(uint8_t *p, uint32_t v) {
+  p[0] = uint8_t(v);
+  p[1] = uint8_t(v >> 8);
+  p[2] = uint8_t(v >> 16);
+  p[3] = uint8_t(v >> 24);
+}
+static inline uint32_t load_u32le(const uint8_t *p) {
+  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
 }
 
-// Decrypt an EncMode::XXTEA packet into a stack buffer, recover the
-// crc/timestamp/nonce prefix, run the replay check, and dispatch. The
-// decrypted span is only handed to deliver_(), which dispatches callbacks
-// synchronously, so the buffer's lifetime is sufficient.
-void MulticastPubSub::handle_encrypted_(const DecodedPacket &pkt) {
+// Build the AEAD body in place: [nonce(12)] || ciphertext([crc||ts] prefix +
+// payload) || [tag(16)], with the 12-byte cleartext `header` as the AAD.
+// ChaCha20 is a stream cipher, so we write the plaintext into the ciphertext
+// region and encrypt it where it sits -- no large scratch buffer. Shared by
+// both platform publish() paths.
+void MulticastPubSub::encrypt_body_(const uint8_t *header, uint8_t *body, uint32_t crc,
+                                    std::span<const uint8_t> payload) {
+  uint32_t ts = this->replay_timestamp_();
+  // 12-byte AEAD nonce: random per message; its low 32 bits double as the
+  // replay identity on the receive side.
+  uint8_t *nonce = body;
+  store_u32le(nonce + 0, random_uint32());
+  store_u32le(nonce + 4, random_uint32());
+  store_u32le(nonce + 8, random_uint32());
+  uint8_t *ct = body + AEAD_NONCE_LEN;
+  store_u32le(ct + 0, crc);
+  store_u32le(ct + 4, ts);
+  std::memcpy(ct + AEAD_PREFIX_LEN, payload.data(), payload.size());
+  size_t ct_len = AEAD_PREFIX_LEN + payload.size();
+  chacha20poly1305_encrypt(this->encryption_key_bytes_, nonce, header, HEADER_LEN, ct, ct_len, ct + ct_len);
+}
+
+// Authenticate + decrypt an EncMode::AEAD packet in a stack buffer, recover
+// the crc/timestamp prefix, run the replay check, and dispatch. The decrypted
+// span is only handed to deliver_(), which dispatches callbacks synchronously,
+// so the buffer's lifetime is sufficient.
+void MulticastPubSub::handle_encrypted_(std::span<const uint8_t> raw, const DecodedPacket &pkt) {
   if (!this->encryption_enabled_) {
     ESP_LOGV(TAG, "drop encrypted packet: this node has no encryption key");
     return;
   }
   std::array<uint8_t, MAX_DATAGRAM> work;
-  size_t clen = pkt.payload.size();
-  if (clen > work.size()) {
-    ESP_LOGV(TAG, "drop encrypted packet: ciphertext %zu exceeds buffer", clen);
+  size_t body_len = pkt.payload.size();  // [nonce || ciphertext || tag]
+  if (body_len > work.size() || body_len < AEAD_NONCE_LEN + AEAD_TAG_LEN) {
+    ESP_LOGV(TAG, "drop encrypted packet: bad body length %zu", body_len);
     return;
   }
-  std::memcpy(work.data(), pkt.payload.data(), clen);
-  xxtea::decrypt(reinterpret_cast<uint32_t *>(work.data()), clen / 4,
-                 reinterpret_cast<const uint32_t *>(this->encryption_key_bytes_));
-  uint32_t crc = uint32_t(work[0]) | (uint32_t(work[1]) << 8) | (uint32_t(work[2]) << 16) | (uint32_t(work[3]) << 24);
-  uint32_t ts = uint32_t(work[4]) | (uint32_t(work[5]) << 8) | (uint32_t(work[6]) << 16) | (uint32_t(work[7]) << 24);
-  uint32_t nonce =
-      uint32_t(work[8]) | (uint32_t(work[9]) << 8) | (uint32_t(work[10]) << 16) | (uint32_t(work[11]) << 24);
+  std::memcpy(work.data(), pkt.payload.data(), body_len);
+  const uint8_t *nonce = work.data();
+  uint8_t *ct = work.data() + AEAD_NONCE_LEN;
+  size_t ct_len = body_len - AEAD_NONCE_LEN - AEAD_TAG_LEN;
+  const uint8_t *tag = ct + ct_len;
+  // AAD is the 12-byte cleartext header of the original datagram.
+  if (!chacha20poly1305_decrypt(this->encryption_key_bytes_, nonce, raw.data(), HEADER_LEN, ct, ct_len, tag)) {
+    ESP_LOGV(TAG, "drop encrypted packet: AEAD authentication failed");
+    return;
+  }
+  uint32_t crc = load_u32le(ct + 0);
+  uint32_t ts = load_u32le(ct + 4);
+  uint32_t rnonce = load_u32le(nonce);  // low 32 bits of the AEAD nonce
   if (this->replay_guard_.enabled()) {
     uint32_t now = 0;
     bool now_valid = this->replay_now_(&now);
-    if (!this->replay_guard_.accept(now, now_valid, ts, nonce)) {
-      ESP_LOGV(TAG, "drop encrypted packet: replay/stale (ts=%u nonce=%08x)", ts, nonce);
+    if (!this->replay_guard_.accept(now, now_valid, ts, rnonce)) {
+      ESP_LOGV(TAG, "drop encrypted packet: replay/stale (ts=%u nonce=%08x)", ts, rnonce);
       return;
     }
   }
-  std::span<const uint8_t> body(work.data() + XXTEA_PREFIX_LEN, pkt.plaintext_len);
+  std::span<const uint8_t> body(ct + AEAD_PREFIX_LEN, pkt.plaintext_len);
   this->deliver_(crc, pkt.encoding, body, /*was_encrypted=*/true);
 }
 
@@ -226,7 +238,7 @@ void MulticastPubSub::dump_config() {
                 "  Encryption: %s\n"
                 "  Subscriptions: %u",
                 this->port_, scope_name, this->hops_, rt_buf,
-                this->encryption_enabled_ ? "xxtea-256" : "none",
+                this->encryption_enabled_ ? "chacha20-poly1305" : "none",
                 static_cast<unsigned>(this->subscriptions_.size()));
   if (this->replay_guard_.enabled()) {
     ESP_LOGCONFIG(TAG, "  Replay protection: on (window %us)", this->replay_guard_.window());
@@ -273,11 +285,10 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
     ESP_LOGW(TAG, "publish(%s): pcb not ready", topic.c_str());
     return false;
   }
-  // The encrypted body is roundup4(12 + payload.size()); the +12 is the
-  // [crc || timestamp || nonce] prefix carried inside the ciphertext, so
-  // encrypted publishes are capped 12 bytes lower than plaintext ones (the
-  // up-to-3 bytes of XXTEA word padding still fit under the 1220-byte cap).
-  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - XXTEA_PREFIX_LEN) : MAX_PAYLOAD;
+  // The encrypted body adds aead_body_len(0) = 36 bytes of overhead (12-byte
+  // nonce + [crc || timestamp] prefix + 16-byte tag), so encrypted publishes
+  // are capped 36 bytes lower than plaintext ones.
+  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - aead_body_len(0)) : MAX_PAYLOAD;
   if (payload.size() > effective_max) {
     ESP_LOGE(TAG, "publish('%s') rejected: payload %zu bytes exceeds max %zu (datagram limit %zu - 12-byte header)",
              topic.c_str(), payload.size(), effective_max, MAX_DATAGRAM);
@@ -290,14 +301,14 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
   }
   uint32_t crc = topic_crc32(topic);
   GroupAddr group = topic_to_group(topic, this->scope_);
-  EncMode mode = this->encryption_enabled_ ? EncMode::XXTEA : EncMode::NONE;
-  size_t body_len = (mode == EncMode::XXTEA) ? xxtea_ciphertext_len(payload.size()) : payload.size();
+  EncMode mode = this->encryption_enabled_ ? EncMode::AEAD : EncMode::NONE;
+  size_t body_len = (mode == EncMode::AEAD) ? aead_body_len(payload.size()) : payload.size();
   size_t total = HEADER_LEN + body_len;
   auto datagram = std::make_shared<std::vector<uint8_t>>(total);
   encode_header(crc, encoding, static_cast<uint16_t>(payload.size()), datagram->data(), mode);
   uint8_t *body = datagram->data() + HEADER_LEN;
-  if (mode == EncMode::XXTEA) {
-    this->encrypt_body_(body, body_len, crc, payload);
+  if (mode == EncMode::AEAD) {
+    this->encrypt_body_(datagram->data(), body, crc, payload);
   } else {
     std::memcpy(body, payload.data(), payload.size());
   }
@@ -361,8 +372,8 @@ void MulticastPubSub::on_packet_(std::span<const uint8_t> raw) {
     ESP_LOGV(TAG, "drop packet: decode err %u", static_cast<unsigned>(err));
     return;
   }
-  if (pkt.enc_mode == EncMode::XXTEA) {
-    this->handle_encrypted_(pkt);
+  if (pkt.enc_mode == EncMode::AEAD) {
+    this->handle_encrypted_(raw, pkt);
     return;
   }
   this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false);
@@ -538,8 +549,8 @@ void MulticastPubSub::on_packet_(std::span<const uint8_t> raw) {
     ESP_LOGV(TAG, "drop packet: decode err %u", static_cast<unsigned>(err));
     return;
   }
-  if (pkt.enc_mode == EncMode::XXTEA) {
-    this->handle_encrypted_(pkt);
+  if (pkt.enc_mode == EncMode::AEAD) {
+    this->handle_encrypted_(raw, pkt);
     return;
   }
   this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false);
@@ -585,7 +596,7 @@ void MulticastPubSub::dump_config() {
                 "  Encryption: %s\n"
                 "  Subscriptions: %u",
                 this->port_, scope_name, this->hops_, rt_buf,
-                this->encryption_enabled_ ? "xxtea-256" : "none",
+                this->encryption_enabled_ ? "chacha20-poly1305" : "none",
                 static_cast<unsigned>(this->subscriptions_.size()));
   if (this->replay_guard_.enabled()) {
     ESP_LOGCONFIG(TAG, "  Replay protection: on (window %us)", this->replay_guard_.window());
@@ -642,11 +653,10 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
     ESP_LOGW(TAG, "publish(%s): socket not ready", topic.c_str());
     return false;
   }
-  // The encrypted body is roundup4(12 + payload.size()); the +12 is the
-  // [crc || timestamp || nonce] prefix carried inside the ciphertext, so
-  // encrypted publishes are capped 12 bytes lower than plaintext ones (the
-  // up-to-3 bytes of XXTEA word padding still fit under the 1220-byte cap).
-  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - XXTEA_PREFIX_LEN) : MAX_PAYLOAD;
+  // The encrypted body adds aead_body_len(0) = 36 bytes of overhead (12-byte
+  // nonce + [crc || timestamp] prefix + 16-byte tag), so encrypted publishes
+  // are capped 36 bytes lower than plaintext ones.
+  size_t effective_max = this->encryption_enabled_ ? (MAX_PAYLOAD - aead_body_len(0)) : MAX_PAYLOAD;
   if (payload.size() > effective_max) {
     ESP_LOGE(TAG, "publish('%s') rejected: payload %zu bytes exceeds max %zu (datagram limit %zu - 12-byte header)",
              topic.c_str(), payload.size(), effective_max, MAX_DATAGRAM);
@@ -655,14 +665,14 @@ bool MulticastPubSub::publish(const std::string &topic, std::span<const uint8_t>
   }
   uint32_t crc = topic_crc32(topic);
   GroupAddr group = topic_to_group(topic, this->scope_);
-  EncMode mode = this->encryption_enabled_ ? EncMode::XXTEA : EncMode::NONE;
-  size_t body_len = (mode == EncMode::XXTEA) ? xxtea_ciphertext_len(payload.size()) : payload.size();
+  EncMode mode = this->encryption_enabled_ ? EncMode::AEAD : EncMode::NONE;
+  size_t body_len = (mode == EncMode::AEAD) ? aead_body_len(payload.size()) : payload.size();
   size_t total = HEADER_LEN + body_len;
   auto datagram = std::make_shared<std::vector<uint8_t>>(total);
   encode_header(crc, encoding, static_cast<uint16_t>(payload.size()), datagram->data(), mode);
   uint8_t *body = datagram->data() + HEADER_LEN;
-  if (mode == EncMode::XXTEA) {
-    this->encrypt_body_(body, body_len, crc, payload);
+  if (mode == EncMode::AEAD) {
+    this->encrypt_body_(datagram->data(), body, crc, payload);
   } else {
     std::memcpy(body, payload.data(), payload.size());
   }

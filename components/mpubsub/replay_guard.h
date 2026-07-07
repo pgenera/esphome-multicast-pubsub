@@ -1,13 +1,13 @@
 // Receiver-side replay rejection for encrypted mpubsub traffic.
 //
-// A captured XXTEA datagram is byte-identical however long after it was
+// A captured encrypted datagram is byte-identical however long after it was
 // recorded, so anyone off the L2 segment can replay it. The defense needs
 // no persistent state -- it survives a reboot because the freshness
 // reference is the externally-synced wall clock, not a stored counter:
 //
 //   1. Freshness window. The sender stamps each packet with the current
 //      unix time inside the ciphertext (an attacker without the key can't
-//      move it without breaking the CRC integrity tag). The receiver drops
+//      move it without breaking authentication). The receiver drops
 //      anything more than `window` seconds away from its own clock.
 //
 //   2. Nonce de-duplication. Within the window a verbatim copy would still

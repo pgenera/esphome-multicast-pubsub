@@ -16,19 +16,19 @@
 // Byte 10 (ENC_MODE) signals whether the body is encrypted:
 //   0x00 = NONE  -- plaintext (default; bytes 4-7 carry the topic CRC and
 //                    PAY_LEN equals the on-wire body length).
-//   0x01 = XXTEA -- the body is XXTEA-256 ciphertext over a 12-byte prefix
-//                    followed by the plaintext payload:
-//                      [TOPIC_CRC32 LE (4)][TIMESTAMP LE (4)][NONCE LE (4)]
-//                      || payload
-//                    zero-padded up to roundup4(12 + PAY_LEN) bytes (the
-//                    12-byte prefix already clears XXTEA's 2-word minimum).
-//                    TIMESTAMP is unix epoch seconds (0 = sender had no
-//                    synced clock); NONCE is 4 random bytes per message.
-//                    Together they drive replay rejection (see replay_guard.h).
+//   0x01 = AEAD  -- ChaCha20-Poly1305 (RFC 8439). The body is
+//                      [AEAD_NONCE (12)] || ciphertext || [TAG (16)]
+//                    where the ciphertext encrypts an 8-byte prefix followed
+//                    by the payload:
+//                      [TOPIC_CRC32 LE (4)][TIMESTAMP LE (4)] || payload
+//                    and the 12-byte cleartext header is the AAD. ChaCha20 is
+//                    a stream cipher, so the ciphertext is exactly
+//                    8 + PAY_LEN bytes (no padding). TIMESTAMP is unix epoch
+//                    seconds (0 = sender had no synced clock); the AEAD nonce
+//                    doubles as the replay identity (see replay_guard.h).
 //                    PAY_LEN stays the plaintext payload length; bytes 4-7
-//                    are written as zero by the sender and ignored on
-//                    receive (the real CRC32 lives at the start of the
-//                    decrypted plaintext).
+//                    are written as zero by the sender (the real CRC32 lives
+//                    at the start of the decrypted plaintext).
 //   0x02..0xFF       -- reserved, receivers MUST drop.
 //
 // See ../../docs/PROTOCOL.md for the full specification and matching
@@ -39,6 +39,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+
+#include "chacha20poly1305.h"  // AEAD_NONCE_LEN, AEAD_TAG_LEN
 
 namespace esphome::multicast_pubsub {
 
@@ -64,26 +66,24 @@ constexpr bool is_known_encoding(uint8_t value) {
 
 enum class EncMode : uint8_t {
   NONE = 0x00,
-  XXTEA = 0x01,
+  AEAD = 0x01,  // ChaCha20-Poly1305
   // 0x02..0xFF reserved.
 };
 
 constexpr bool is_known_enc_mode(uint8_t value) {
-  return value == static_cast<uint8_t>(EncMode::NONE) || value == static_cast<uint8_t>(EncMode::XXTEA);
+  return value == static_cast<uint8_t>(EncMode::NONE) || value == static_cast<uint8_t>(EncMode::AEAD);
 }
 
-// Bytes prepended to the plaintext inside the XXTEA ciphertext, ahead of the
-// user payload: TOPIC_CRC32 (4) + TIMESTAMP (4) + NONCE (4). The CRC is the
-// integrity tag; the timestamp + nonce feed receiver-side replay rejection.
-constexpr size_t XXTEA_PREFIX_LEN = 12;
+// Bytes prepended to the AEAD *plaintext* (encrypted + authenticated), ahead
+// of the user payload: TOPIC_CRC32 (4) for dispatch + TIMESTAMP (4) for the
+// freshness check. Both stay confidential and tamper-proof under the tag.
+constexpr size_t AEAD_PREFIX_LEN = 8;
 
-// Ciphertext length for a plaintext payload of `payload_len` bytes under
-// EncMode::XXTEA. Equals roundup4(XXTEA_PREFIX_LEN + payload_len): the
-// 12-byte prefix plus the payload, zero-padded up to a multiple of 4 bytes
-// (XXTEA word size). The prefix alone already exceeds XXTEA's 2-word (8-byte)
-// minimum, so no separate floor is needed.
-constexpr size_t xxtea_ciphertext_len(size_t payload_len) {
-  return (payload_len + XXTEA_PREFIX_LEN + 3) & ~size_t{3};
+// On-wire encrypted-body length for a payload of `payload_len` bytes:
+// the 12-byte nonce, the ciphertext (8-byte prefix + payload, no padding --
+// ChaCha20 is a stream cipher), and the 16-byte Poly1305 tag.
+constexpr size_t aead_body_len(size_t payload_len) {
+  return AEAD_NONCE_LEN + AEAD_PREFIX_LEN + payload_len + AEAD_TAG_LEN;
 }
 
 enum class DecodeError : uint8_t {
@@ -102,14 +102,14 @@ struct DecodedPacket {
   Encoding encoding;
   EncMode enc_mode;
   // Plaintext payload length declared by the sender. For EncMode::NONE this
-  // equals payload.size(); for EncMode::XXTEA this is the post-decrypt
-  // payload length (caller decrypts `payload` then takes the bytes at offset
-  // 4 .. 4 + plaintext_len).
+  // equals payload.size(); for EncMode::AEAD this is the post-decrypt payload
+  // length (the caller verifies + decrypts `payload`, then takes the bytes at
+  // offset AEAD_PREFIX_LEN .. AEAD_PREFIX_LEN + plaintext_len).
   uint16_t plaintext_len;
   // View into the caller-provided buffer. Valid as long as the buffer is.
-  // For EncMode::NONE this is the plaintext body. For EncMode::XXTEA this is
-  // the *ciphertext* (length is `xxtea_ciphertext_len(plaintext_len)`); the
-  // caller is responsible for in-place decryption and slicing.
+  // For EncMode::NONE this is the plaintext body. For EncMode::AEAD this is
+  // the full encrypted body ([nonce || ciphertext || tag], length
+  // `aead_body_len(plaintext_len)`); the caller authenticates and decrypts.
   std::span<const uint8_t> payload;
 };
 

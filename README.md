@@ -189,11 +189,11 @@ bottom of [`LICENSE`](LICENSE).
 
 * IPv6 only. IPv4 / mDNS coordination is described in the spec but not yet
   implemented.
-* Optional XXTEA-256 payload encryption with optional replay protection
-  (`encryption.replay_window`, see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §3.3).
-  No message signing / authenticated encryption and no forward secrecy: a
-  key-holder can still forge traffic, so for stronger guarantees layer a real
-  AEAD in the payload or run on an isolated/encrypted L2.
+* Optional ChaCha20-Poly1305 payload encryption (authenticated; RFC 8439)
+  with optional replay protection (`encryption.replay_window`, see
+  [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §3.3). Single shared key, so no
+  forward secrecy and any key-holder can forge traffic; for per-peer identity
+  or key rotation run on an isolated/encrypted L2.
 * No MQTT-style wildcards (`+`, `#`) — each subscription is one exact topic.
   A separate bridge can fan out wildcards from MQTT.
 * No retain / last-will semantics; multicast UDP is fire-and-forget.

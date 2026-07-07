@@ -39,8 +39,8 @@ DecodeError decode(std::span<const uint8_t> data, DecodedPacket *out) {
   uint32_t crc = uint32_t(data[4]) | (uint32_t(data[5]) << 8) | (uint32_t(data[6]) << 16) | (uint32_t(data[7]) << 24);
   uint16_t payload_len = uint16_t(data[8]) | (uint16_t(data[9]) << 8);
   // byte 11 reserved; ignored on decode for forward-compatibility.
-  if (enm == static_cast<uint8_t>(EncMode::XXTEA)) {
-    size_t expected = HEADER_LEN + xxtea_ciphertext_len(payload_len);
+  if (enm == static_cast<uint8_t>(EncMode::AEAD)) {
+    size_t expected = HEADER_LEN + aead_body_len(payload_len);
     if (data.size() != expected)
       return DecodeError::CIPHERTEXT_TOO_SHORT;
   } else {

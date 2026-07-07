@@ -332,6 +332,20 @@ def test_rejects_replay_window_without_time(tmp_path: Path) -> None:
     assert "replay_window" in (r.stdout + r.stderr)
 
 
+def test_accepts_replay_window_zero_without_time(tmp_path: Path) -> None:
+    """replay_window: 0s disables the check, so it needs no time source."""
+    body = textwrap.dedent(
+        """\
+        mpubsub:
+          encryption:
+            key: "passphrase"
+            replay_window: 0s
+        """
+    )
+    r = _esphome_config(_wrap(body), tmp_path)
+    assert "Configuration is valid" in (r.stdout + r.stderr), r.stdout + r.stderr
+
+
 def test_accepts_replay_window_with_time(tmp_path: Path) -> None:
     # homeassistant time validates on the host platform (sntp doesn't); it
     # needs api:, which host supports.

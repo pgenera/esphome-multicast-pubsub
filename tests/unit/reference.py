@@ -35,8 +35,8 @@ KNOWN_ENCODINGS = (ENCODING_RAW, ENCODING_PROTOBUF)
 
 # Encryption mode enum -- one of these goes in header byte 10.
 ENC_MODE_NONE = 0x00
-ENC_MODE_XXTEA = 0x01
-KNOWN_ENC_MODES = (ENC_MODE_NONE, ENC_MODE_XXTEA)
+ENC_MODE_AEAD = 0x01  # ChaCha20-Poly1305 (RFC 8439)
+KNOWN_ENC_MODES = (ENC_MODE_NONE, ENC_MODE_AEAD)
 
 SCOPE_LINK_LOCAL = 0x2
 SCOPE_SITE_LOCAL = 0x5
@@ -70,65 +70,116 @@ def topic_crc32(topic: str) -> int:
 
 
 # ----------------------------------------------------------------------------
-# XXTEA-256
+# ChaCha20-Poly1305 AEAD (RFC 8439)
 #
-# Block-cipher operating in place on a vector of uint32_t words. Byte-for-byte
-# compatible with ``esphome::xxtea`` (which packet_transport reuses and which
-# devices actually run on the wire): 256-bit key = 8 uint32 words, key index
-# ``k[(p ^ e) & 7]`` with ``e = sum >> 2`` (NOT the 128-bit-style
-# ``k[(p & 3) ^ e]``). The C++ implementation is authoritative here -- the
-# bridge must match it to interoperate with devices.
+# A vetted authenticated cipher: confidentiality from ChaCha20 plus a real
+# 128-bit Poly1305 tag (a forgery is ~2^-128, vs the 32-bit topic-CRC "tag"
+# the XXTEA scheme leaned on). ChaCha20 is a stream cipher, so the ciphertext
+# is exactly the plaintext length -- no block padding. Verified against the
+# RFC 8439 §2.8.2 test vector by test_encryption.py. 256-bit key.
 # ----------------------------------------------------------------------------
 
-_DELTA = 0x9E3779B9
+AEAD_KEY_LEN = 32
+AEAD_NONCE_LEN = 12  # 96-bit ChaCha20 nonce, one per message
+AEAD_TAG_LEN = 16  # Poly1305 tag
+# Bytes prepended to the *plaintext* (encrypted + authenticated), ahead of the
+# user payload: TOPIC_CRC32 (4) for dispatch + TIMESTAMP (4) for the freshness
+# check. Both stay confidential (encrypted) and tamper-proof (under the tag).
+AEAD_PREFIX_LEN = 8
 
 
-def _xxtea_mx(z: int, y: int, sum_: int, p: int, e: int, k: list[int]) -> int:
-    return (((z >> 5 ^ y << 2) + (y >> 3 ^ z << 4)) ^ ((sum_ ^ y) + (k[(p ^ e) & 7] ^ z))) & 0xFFFFFFFF
+def _rotl32(x: int, n: int) -> int:
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
 
 
-def xxtea_encrypt(words: list[int], key: list[int]) -> None:
-    """In-place XXTEA encrypt of ``words`` (uint32 list) under ``key`` (8 uint32s)."""
-    n = len(words)
-    if n < 2:
-        raise ValueError("XXTEA requires at least 2 words")
-    rounds = 6 + 52 // n
-    sum_ = 0
-    z = words[n - 1]
-    for _ in range(rounds):
-        sum_ = (sum_ + _DELTA) & 0xFFFFFFFF
-        e = sum_ >> 2
-        for p in range(n - 1):
-            y = words[p + 1]
-            words[p] = (words[p] + _xxtea_mx(z, y, sum_, p, e, key)) & 0xFFFFFFFF
-            z = words[p]
-        y = words[0]
-        words[n - 1] = (words[n - 1] + _xxtea_mx(z, y, sum_, n - 1, e, key)) & 0xFFFFFFFF
-        z = words[n - 1]
+def _chacha_qr(s: list[int], a: int, b: int, c: int, d: int) -> None:
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
+    s[d] = _rotl32(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+    s[b] = _rotl32(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
+    s[d] = _rotl32(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+    s[b] = _rotl32(s[b] ^ s[c], 7)
 
 
-def xxtea_decrypt(words: list[int], key: list[int]) -> None:
-    """In-place XXTEA decrypt of ``words`` under ``key``."""
-    n = len(words)
-    if n < 2:
-        raise ValueError("XXTEA requires at least 2 words")
-    rounds = 6 + 52 // n
-    sum_ = (rounds * _DELTA) & 0xFFFFFFFF
-    y = words[0]
-    for _ in range(rounds):
-        e = sum_ >> 2
-        for p in range(n - 1, 0, -1):
-            z = words[p - 1]
-            words[p] = (words[p] - _xxtea_mx(z, y, sum_, p, e, key)) & 0xFFFFFFFF
-            y = words[p]
-        z = words[n - 1]
-        words[0] = (words[0] - _xxtea_mx(z, y, sum_, 0, e, key)) & 0xFFFFFFFF
-        y = words[0]
-        sum_ = (sum_ - _DELTA) & 0xFFFFFFFF
+def _chacha_block(key: bytes, counter: int, nonce: bytes) -> bytes:
+    const = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+    state = const + list(struct.unpack("<8I", key)) + [counter & 0xFFFFFFFF] + list(struct.unpack("<3I", nonce))
+    w = list(state)
+    for _ in range(10):  # 20 rounds = 10 column + 10 diagonal pairs
+        _chacha_qr(w, 0, 4, 8, 12)
+        _chacha_qr(w, 1, 5, 9, 13)
+        _chacha_qr(w, 2, 6, 10, 14)
+        _chacha_qr(w, 3, 7, 11, 15)
+        _chacha_qr(w, 0, 5, 10, 15)
+        _chacha_qr(w, 1, 6, 11, 12)
+        _chacha_qr(w, 2, 7, 8, 13)
+        _chacha_qr(w, 3, 4, 9, 14)
+    return struct.pack("<16I", *[(w[i] + state[i]) & 0xFFFFFFFF for i in range(16)])
+
+
+def chacha20(key: bytes, counter: int, nonce: bytes, data: bytes) -> bytes:
+    """ChaCha20 keystream XOR of ``data`` (RFC 8439 §2.4)."""
+    out = bytearray()
+    for i in range(0, len(data), 64):
+        ks = _chacha_block(key, counter + i // 64, nonce)
+        out += bytes(b ^ ks[j] for j, b in enumerate(data[i : i + 64]))
+    return bytes(out)
+
+
+def _poly1305(otk: bytes, msg: bytes) -> bytes:
+    r = int.from_bytes(otk[0:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    s = int.from_bytes(otk[16:32], "little")
+    acc = 0
+    p = (1 << 130) - 5
+    for i in range(0, len(msg), 16):
+        blk = msg[i : i + 16]
+        n = int.from_bytes(blk + b"\x01", "little")  # append the high "1" bit
+        acc = ((acc + n) * r) % p
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def _pad16(b: bytes) -> bytes:
+    return b"\x00" * ((16 - len(b) % 16) % 16)
+
+
+def _poly1305_key(key: bytes, nonce: bytes) -> bytes:
+    return _chacha_block(key, 0, nonce)[:32]
+
+
+def aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes]:
+    """ChaCha20-Poly1305 encrypt (RFC 8439 §2.8). Returns ``(ciphertext, tag)``."""
+    otk = _poly1305_key(key, nonce)
+    ct = chacha20(key, 1, nonce, plaintext)
+    mac_data = aad + _pad16(aad) + ct + _pad16(ct) + struct.pack("<QQ", len(aad), len(ct))
+    return ct, _poly1305(otk, mac_data)
+
+
+def aead_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: bytes) -> bytes:
+    """ChaCha20-Poly1305 decrypt + verify. Raises :class:`WireError` if the
+    tag doesn't authenticate (wrong key, tampering, or truncation)."""
+    otk = _poly1305_key(key, nonce)
+    mac_data = aad + _pad16(aad) + ciphertext + _pad16(ciphertext) + struct.pack("<QQ", len(aad), len(ciphertext))
+    expected = _poly1305(otk, mac_data)
+    # Constant-time-ish compare; the reference isn't a hardening target but
+    # this keeps the intent clear.
+    if not _ct_eq(expected, tag):
+        raise WireError("AEAD authentication failed (wrong key or tampered packet)")
+    return chacha20(key, 1, nonce, ciphertext)
+
+
+def _ct_eq(a: bytes, b: bytes) -> bool:
+    if len(a) != len(b):
+        return False
+    diff = 0
+    for x, y in zip(a, b):
+        diff |= x ^ y
+    return diff == 0
 
 
 def derive_key(passphrase: str) -> bytes:
-    """Hash a user passphrase to the 32-byte XXTEA-256 key.
+    """Hash a user passphrase to the 32-byte AEAD key.
 
     Matches ``hashlib.sha256(passphrase).digest()`` -- the same key
     derivation packet_transport uses for its ``encryption.key`` option.
@@ -136,36 +187,11 @@ def derive_key(passphrase: str) -> bytes:
     return hashlib.sha256(passphrase.encode("utf-8")).digest()
 
 
-def _bytes_to_words(b: bytes) -> list[int]:
-    if len(b) % 4 != 0:
-        raise ValueError(f"length {len(b)} is not a multiple of 4")
-    return list(struct.unpack(f"<{len(b) // 4}I", b))
-
-
-def _words_to_bytes(words: list[int]) -> bytes:
-    return struct.pack(f"<{len(words)}I", *words)
-
-
-# Fixed prefix carried at the start of every XXTEA plaintext, ahead of the
-# user payload:
-#   [ TOPIC_CRC32 LE (4) ][ TIMESTAMP LE (4) ][ NONCE LE (4) ]
-# TIMESTAMP is unix epoch seconds (0 = the sender had no synchronized clock);
-# NONCE is 4 random bytes per message. Together they give the receiver a
-# freshness reference (the clock) and a per-message identity (the nonce) for
-# replay rejection -- see ReplayGuard. The CRC stays the integrity tag.
-XXTEA_PREFIX_LEN = 12
-
-
-def xxtea_ciphertext_len(plaintext_len: int) -> int:
-    """Length of the ciphertext for an mpubsub payload of ``plaintext_len`` bytes.
-
-    The plaintext is ``[crc32 || timestamp || nonce] (12 bytes) || payload``,
-    zero-padded up to a multiple of 4 bytes (XXTEA word size). The 12-byte
-    prefix already exceeds XXTEA's 2-word (8-byte) minimum, so no separate
-    floor is needed.
-    """
-    needed = plaintext_len + XXTEA_PREFIX_LEN
-    return (needed + 3) & ~3
+def aead_body_len(payload_len: int) -> int:
+    """On-wire encrypted-body length for a payload of ``payload_len`` bytes:
+    the 12-byte nonce, the ciphertext (8-byte prefix + payload, no padding),
+    and the 16-byte tag."""
+    return AEAD_NONCE_LEN + AEAD_PREFIX_LEN + payload_len + AEAD_TAG_LEN
 
 
 @dataclass(frozen=True)
@@ -175,6 +201,13 @@ class Message:
     encoding: int = ENCODING_RAW
 
 
+def _build_header(header_crc: int, encoding: int, payload_len: int, enc_mode: int) -> bytes:
+    # 12-byte header: MAGIC(2) VER(1) ENC(1) CRC(4 LE) PAYLOAD_LEN(2 LE) ENM(1) RSV(1)
+    header = MAGIC + bytes((VERSION, encoding & 0xFF)) + struct.pack("<IH", header_crc, payload_len) + bytes((enc_mode, 0))
+    assert len(header) == HEADER_LEN
+    return header
+
+
 def encode(
     topic: str,
     payload: bytes,
@@ -182,7 +215,7 @@ def encode(
     *,
     key: bytes | None = None,
     timestamp: int | None = None,
-    nonce: int | None = None,
+    nonce: bytes | None = None,
 ) -> bytes:
     """Serialize a publication to the on-wire byte sequence.
 
@@ -190,17 +223,19 @@ def encode(
     encoding value is unknown, or (when ``key`` is set) the encrypted
     datagram would exceed :data:`MAX_DATAGRAM`.
 
-    When ``key`` is set, the body is XXTEA-256 ciphertext over
-    ``[crc32 || timestamp || nonce] || payload || zero pad`` (see
-    :data:`XXTEA_PREFIX_LEN`). The cleartext header's TOPIC_CRC32 field is
-    set to zero; the real CRC32 is the first 4 bytes of the decrypted
-    plaintext.
+    When ``key`` is set, the body is ChaCha20-Poly1305:
+    ``[AEAD_NONCE (12)] || ciphertext || [TAG (16)]`` where the ciphertext
+    encrypts ``[TOPIC_CRC32 (4)] || [TIMESTAMP (4)] || payload`` and the
+    12-byte cleartext header is the AAD. The cleartext header's TOPIC_CRC32
+    field is set to zero (the real CRC is recovered from the decrypted
+    plaintext) so the topic identity isn't leaked.
 
-    ``timestamp`` (unix epoch seconds) and ``nonce`` (a 32-bit value) feed
-    the receiver's replay rejection. They default to the current wall clock
-    and a fresh random value; pass them explicitly for deterministic
-    encodings (known-answer vectors). ``timestamp=0`` marks "the sender had
-    no synchronized clock" and is rejected by a replay-checking receiver.
+    ``timestamp`` (unix epoch seconds) feeds the receiver's freshness check
+    and ``nonce`` (the 12-byte AEAD nonce) is its per-message identity for
+    de-duplication. They default to the current wall clock and a fresh random
+    nonce; pass them explicitly for deterministic encodings (known-answer
+    vectors). ``timestamp=0`` marks "the sender had no synchronized clock"
+    and is rejected by a replay-checking receiver.
     """
     if len(payload) > MAX_PAYLOAD:
         raise ValueError(f"payload too large ({len(payload)} > {MAX_PAYLOAD})")
@@ -208,37 +243,22 @@ def encode(
         raise ValueError(f"unknown encoding: {encoding:#04x}")
     crc = topic_crc32(topic)
     if key is None:
-        enc_mode = ENC_MODE_NONE
-        header_crc = crc
-        body = payload
-    else:
-        if len(key) != 32:
-            raise ValueError(f"key must be 32 bytes, got {len(key)}")
-        if timestamp is None:
-            timestamp = int(time.time())
-        if nonce is None:
-            nonce = int.from_bytes(os.urandom(4), "little")
-        clen = xxtea_ciphertext_len(len(payload))
-        if HEADER_LEN + clen > MAX_DATAGRAM:
-            raise ValueError(
-                f"encrypted payload too large ({len(payload)} -> {clen}-byte ciphertext)"
-            )
-        prefix = struct.pack("<III", crc, timestamp & 0xFFFFFFFF, nonce & 0xFFFFFFFF)
-        plaintext = prefix + payload + b"\x00" * (clen - XXTEA_PREFIX_LEN - len(payload))
-        words = _bytes_to_words(plaintext)
-        xxtea_encrypt(words, _bytes_to_words(key))
-        body = _words_to_bytes(words)
-        enc_mode = ENC_MODE_XXTEA
-        header_crc = 0
-    # 12-byte header: MAGIC(2) VER(1) ENC(1) CRC(4 LE) PAYLOAD_LEN(2 LE) ENM(1) RSV(1)
-    header = (
-        MAGIC
-        + bytes((VERSION, encoding & 0xFF))
-        + struct.pack("<IH", header_crc, len(payload))
-        + bytes((enc_mode, 0))
-    )
-    assert len(header) == HEADER_LEN
-    return header + body
+        return _build_header(crc, encoding, len(payload), ENC_MODE_NONE) + payload
+    if len(key) != 32:
+        raise ValueError(f"key must be 32 bytes, got {len(key)}")
+    if timestamp is None:
+        timestamp = int(time.time())
+    if nonce is None:
+        nonce = os.urandom(AEAD_NONCE_LEN)
+    if len(nonce) != AEAD_NONCE_LEN:
+        raise ValueError(f"nonce must be {AEAD_NONCE_LEN} bytes, got {len(nonce)}")
+    body_len = aead_body_len(len(payload))
+    if HEADER_LEN + body_len > MAX_DATAGRAM:
+        raise ValueError(f"encrypted payload too large ({len(payload)} -> {body_len}-byte body)")
+    header = _build_header(0, encoding, len(payload), ENC_MODE_AEAD)
+    plaintext = struct.pack("<II", crc, timestamp & 0xFFFFFFFF) + payload
+    ct, tag = aead_encrypt(key, nonce, plaintext, aad=header)
+    return header + nonce + ct + tag
 
 
 class WireError(ValueError):
@@ -267,7 +287,7 @@ def decode(data: bytes, *, key: bytes | None = None) -> DecodedMessage:
     """Parse a datagram into a :class:`DecodedMessage`.
 
     For encrypted packets the caller MUST supply ``key`` (the 32-byte
-    XXTEA-256 key); the returned ``topic_crc`` is recovered from the
+    ChaCha20-Poly1305 key); the returned ``topic_crc`` is recovered from the
     decrypted plaintext, ``payload`` is the decrypted slice, and
     ``timestamp`` / ``nonce`` carry the replay fields.
 
@@ -290,23 +310,27 @@ def decode(data: bytes, *, key: bytes | None = None) -> DecodedMessage:
         raise WireError(f"unknown enc_mode: {enc_mode:#04x}")
     header_crc, payload_len = struct.unpack("<IH", data[4:10])
     # byte 11 is reserved; ignored on decode for forward-compatibility.
-    if enc_mode == ENC_MODE_XXTEA:
-        expected = HEADER_LEN + xxtea_ciphertext_len(payload_len)
+    if enc_mode == ENC_MODE_AEAD:
+        expected = HEADER_LEN + aead_body_len(payload_len)
         if len(data) != expected:
             raise WireError(
                 f"encrypted length mismatch: header says {payload_len} -> "
-                f"{expected - HEADER_LEN}-byte ciphertext, datagram has "
+                f"{expected - HEADER_LEN}-byte body, datagram has "
                 f"{len(data) - HEADER_LEN}"
             )
         if key is None:
             raise WireError("encrypted packet but no key supplied")
         if len(key) != 32:
             raise ValueError(f"key must be 32 bytes, got {len(key)}")
-        words = _bytes_to_words(data[HEADER_LEN:])
-        xxtea_decrypt(words, _bytes_to_words(key))
-        plaintext = _words_to_bytes(words)
-        crc, ts, nonce = struct.unpack("<III", plaintext[0:XXTEA_PREFIX_LEN])
-        body = plaintext[XXTEA_PREFIX_LEN : XXTEA_PREFIX_LEN + payload_len]
+        aead_nonce = data[HEADER_LEN : HEADER_LEN + AEAD_NONCE_LEN]
+        ct = data[HEADER_LEN + AEAD_NONCE_LEN : len(data) - AEAD_TAG_LEN]
+        tag = data[len(data) - AEAD_TAG_LEN :]
+        aad = data[0:HEADER_LEN]
+        plaintext = aead_decrypt(key, aead_nonce, ct, tag, aad)  # raises on auth failure
+        crc, ts = struct.unpack("<II", plaintext[0:AEAD_PREFIX_LEN])
+        body = plaintext[AEAD_PREFIX_LEN:]
+        # The replay de-dup key is the low 32 bits of the (random) AEAD nonce.
+        nonce = int.from_bytes(aead_nonce[0:4], "little")
         return DecodedMessage(crc, encoding, body, ts, nonce, was_encrypted=True)
     # Plaintext path
     if HEADER_LEN + payload_len != len(data):
@@ -327,7 +351,7 @@ def decode(data: bytes, *, key: bytes | None = None) -> DecodedMessage:
 #
 #   1. Freshness window. The sender stamps each packet with the current unix
 #      time inside the ciphertext (an attacker without the key can't move it
-#      without breaking the CRC). The receiver drops anything more than
+#      without breaking the AEAD tag). The receiver drops anything more than
 #      `window` seconds from its own clock.
 #
 #   2. Nonce de-duplication. Within the window an attacker could still resend
