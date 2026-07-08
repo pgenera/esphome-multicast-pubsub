@@ -59,14 +59,22 @@ on_...:
   - mpubsub.publish:
       id: my_pubsub              # optional, only with multiple instances
       topic: "home/temp"
-      payload: !lambda 'return std::to_string(x);'
+      payload: "hello"           # a plain string literal works directly...
+  - mpubsub.publish:
+      topic: "home/temp"
+      payload: !lambda 'return std::to_string(x);'   # ...or a lambda for dynamic values
 ```
+
+Both `topic:` and `payload:` are *templatable*: pass a plain string
+literal for static messages, or a `!lambda` when the value is computed at
+runtime. A lambda is not required — static strings are a first-class path
+(and the only one that can be size-checked at config time).
 
 | Key       | Required | Type             | Notes                                                                                  |
 |-----------|:--------:|------------------|----------------------------------------------------------------------------------------|
 | `id`      | no       | id               | Pick a specific `mpubsub:` instance.                                          |
-| `topic`   | yes      | templatable str  | UTF-8, non-empty, ≤200 bytes, no NUL.                                                  |
-| `payload` | yes      | templatable str  | Raw bytes-as-string. Maximum 1220 bytes; literals over the limit are rejected at config time. |
+| `topic`   | yes      | templatable str  | UTF-8, non-empty, ≤200 bytes, no NUL. Plain literal or `!lambda`.                       |
+| `payload` | yes      | templatable str  | Raw bytes-as-string. Plain literal or `!lambda`. Maximum 1220 bytes; literals over the limit are rejected at config time. |
 | `retransmit_count` | no | templatable int 1–255 or `-1` | Override the component-level `retransmit_count` for this one publish. Useful for "critical" messages (door open/close, alarm trips) that warrant more aggressive resending without raising the global rate. `-1` activates indefinite mode for the topic; a subsequent publish to the same topic ends it. The component-level `retransmit_delay` is used either way -- the per-action override doesn't carry its own delay. |
 
 If `payload` is a runtime lambda we can't size-check at config time. An
