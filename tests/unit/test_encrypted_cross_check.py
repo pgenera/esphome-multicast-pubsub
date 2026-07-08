@@ -106,6 +106,21 @@ def _run_and_capture(binary: Path, value: bytes, key: bytes, tmp_path: Path) -> 
     return _ANSI.sub("", log.read_text(errors="replace"))
 
 
+# Diagnostic sensor states are logged as e.g. "'verify ok': Received new state
+# 2.000000". Pull the highest value published for a given sensor (counters only
+# climb), or None if it never published.
+_STATE_RE = re.compile(r"'(?P<name>[^']+)': Received new state (?P<val>[0-9.]+)")
+
+
+def _latest_counter(log: str, name: str) -> float | None:
+    vals = [
+        float(m.group("val"))
+        for m in _STATE_RE.finditer(log)
+        if m.group("name") == name
+    ]
+    return max(vals) if vals else None
+
+
 def test_encrypted_packet_with_matching_key_is_delivered(tmp_path: Path) -> None:
     log = _run_and_capture(SUB_ENC, b"42.5", RIGHT_KEY, tmp_path)
     # The subscribed sensor parses the RAW ASCII float and publishes it; at
@@ -113,6 +128,14 @@ def test_encrypted_packet_with_matching_key_is_delivered(tmp_path: Path) -> None
     # offset -- the old socket-path bug -- the float parse would not yield
     # 42.5.)
     assert "42.5" in log, f"expected decrypted sensor value in log:\n{log[-2000:]}"
+    # A successful authenticate+decrypt bumps verify_ok and never verify_failed.
+    # (This also guards against a crash after delivery: a process that died
+    # would leave an empty/truncated log and fail here rather than pass on the
+    # weak "42.5 present" check alone.)
+    assert (_latest_counter(log, "verify ok") or 0) >= 1, f"verify_ok should climb:\n{log[-2000:]}"
+    assert (_latest_counter(log, "verify failed") or 0) == 0, (
+        f"verify_failed should stay 0 for the right key:\n{log[-2000:]}"
+    )
 
 
 def test_encrypted_packet_with_wrong_key_is_dropped(tmp_path: Path) -> None:
@@ -120,3 +143,12 @@ def test_encrypted_packet_with_wrong_key_is_dropped(tmp_path: Path) -> None:
     # a packet sealed under RIGHT_KEY, so the value never reaches the sensor.
     log = _run_and_capture(SUB_WRONG, b"42.5", RIGHT_KEY, tmp_path)
     assert "42.5" not in log, f"wrong-key subscriber should not decode the value:\n{log[-2000:]}"
+    # ...but it must still *process* the packet and record the auth failure.
+    # Asserting the counter moved distinguishes "rejected the packet" from
+    # "crashed / never received it" -- the latter would also lack "42.5".
+    assert (_latest_counter(log, "verify failed") or 0) >= 1, (
+        f"verify_failed should climb on a wrong-key packet:\n{log[-2000:]}"
+    )
+    assert (_latest_counter(log, "verify ok") or 0) == 0, (
+        f"verify_ok should stay 0 for the wrong key:\n{log[-2000:]}"
+    )

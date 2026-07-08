@@ -441,6 +441,12 @@ async def to_code(config):
     for slug, setter in (
         ("packets_sent", "set_packets_sent_sensor"),
         ("packets_received", "set_packets_received_sensor"),
+        # Payload-verification counters. On an encrypted node these track AEAD
+        # decryption (ok = authenticated, failed = wrong key/tampered); on a
+        # plaintext node they track the header topic-CRC (ok = matched a
+        # subscription, failed = unrecognized topic).
+        ("verify_ok", "set_verify_ok_sensor"),
+        ("verify_failed", "set_verify_failed_sensor"),
     ):
         s_id = ID(f"{parent_slug}_{slug}", is_declaration=True, type=esphome_sensor.Sensor)
         s_config = {

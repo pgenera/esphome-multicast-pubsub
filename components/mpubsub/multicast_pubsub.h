@@ -195,9 +195,16 @@ class MulticastPubSub : public Component {
   // iterates registered sensors (prometheus, web_server, HA API, etc).
   void set_packets_sent_sensor(sensor::Sensor *s) { this->packets_sent_sensor_ = s; }
   void set_packets_received_sensor(sensor::Sensor *s) { this->packets_received_sensor_ = s; }
+  void set_verify_ok_sensor(sensor::Sensor *s) { this->verify_ok_sensor_ = s; }
+  void set_verify_failed_sensor(sensor::Sensor *s) { this->verify_failed_sensor_ = s; }
 
  protected:
-  void deliver_(uint32_t crc, Encoding encoding, std::span<const uint8_t> payload, bool was_encrypted);
+  // Dispatch a decoded body to matching subscriptions. Returns true if the
+  // topic CRC matched at least one subscription (the topic is recognized),
+  // even if that subscription then dropped it (e.g. require_encryption). The
+  // plaintext receive path uses this to feed the verify_ok/verify_failed
+  // counters (a CRC that matches nothing is an unrecognized-topic drop).
+  bool deliver_(uint32_t crc, Encoding encoding, std::span<const uint8_t> payload, bool was_encrypted);
   // Fill the AEAD body at `body` (= header + HEADER_LEN) -- [nonce] ||
   // ciphertext([crc || timestamp] prefix + payload) || [tag] -- encrypting in
   // place with the 12-byte cleartext `header` as the AAD. Shared by both
@@ -306,17 +313,29 @@ class MulticastPubSub : public Component {
 
   sensor::Sensor *packets_sent_sensor_{nullptr};
   sensor::Sensor *packets_received_sensor_{nullptr};
+  // Payload verification counters. On an encrypted node these track AEAD
+  // decryption: verify_ok_ = authenticated, verify_failed_ = authentication
+  // failed (wrong key / tampered / truncated). On a plaintext node they track
+  // the header topic-CRC: verify_ok_ = matched a subscription, verify_failed_
+  // = matched none (unrecognized topic). Replay/stale and require_encryption
+  // drops are deliberately excluded -- those aren't verification failures.
+  sensor::Sensor *verify_ok_sensor_{nullptr};
+  sensor::Sensor *verify_failed_sensor_{nullptr};
   // Packet-level counters: every UDP datagram counts, including
   // retransmits on the sent side (one retransmit_count=3 publish() bumps
   // packets_sent_ by 3) and every received datagram on the recv side
   // before any topic / CRC filtering.
   uint32_t packets_sent_{0};
   uint32_t packets_received_{0};
+  uint32_t verify_ok_{0};
+  uint32_t verify_failed_{0};
   // Last value published to the sensors -- compared each loop() to avoid
   // republishing identical readings (publish_state() is otherwise quite
   // chatty: triggers filters, MQTT, prometheus state churn, ...).
   uint32_t last_published_sent_{UINT32_MAX};
   uint32_t last_published_received_{UINT32_MAX};
+  uint32_t last_published_verify_ok_{UINT32_MAX};
+  uint32_t last_published_verify_failed_{UINT32_MAX};
 
   // Active indefinite-retransmit jobs, keyed by topic. Each entry's
   // std::function reschedules itself via set_timeout("rt:<topic>", ...);

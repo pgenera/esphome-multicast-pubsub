@@ -37,6 +37,21 @@ The component is `MULTI_CONF`-friendly: you can declare two
 `mpubsub:` blocks with different `port:` values to keep separate
 fabrics on the same device.
 
+### Diagnostic counters (auto-created)
+
+Each `mpubsub:` block auto-registers four diagnostic sensors (no config
+needed). They're `disabled_by_default` so they don't clutter the UI, but
+anything that iterates registered sensors — Prometheus, the web server,
+the HA API — still sees them. Enable them per-device when investigating
+link or crypto health.
+
+| Sensor            | Counts                                                                                     |
+|-------------------|--------------------------------------------------------------------------------------------|
+| `packets_sent`    | UDP datagrams sent, including retransmits (a `retransmit_count: 3` publish adds 3).         |
+| `packets_received`| UDP datagrams received, before any topic/CRC filtering.                                    |
+| `verify_ok`       | Payloads that verified. On an **encrypted** node: packets that authenticated (decrypted). On a **plaintext** node: packets whose topic-CRC matched a subscription. |
+| `verify_failed`   | Payloads that failed verification. Encrypted: AEAD authentication failure (wrong key / tampered / truncated). Plaintext: topic-CRC matched no subscription. Replay/stale and `require_encryption` drops are **not** counted here. |
+
 ## `mpubsub.publish:` — action
 
 ```yaml

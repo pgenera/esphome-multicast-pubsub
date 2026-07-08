@@ -53,12 +53,14 @@ void MulticastPubSub::encrypt_body_(const uint8_t *header, uint8_t *body, uint32
 void MulticastPubSub::handle_encrypted_(std::span<const uint8_t> raw, const DecodedPacket &pkt) {
   if (!this->encryption_enabled_) {
     ESP_LOGV(TAG, "drop encrypted packet: this node has no encryption key");
+    this->verify_failed_++;
     return;
   }
   std::array<uint8_t, MAX_DATAGRAM> work;
   size_t body_len = pkt.payload.size();  // [nonce || ciphertext || tag]
   if (body_len > work.size() || body_len < AEAD_NONCE_LEN + AEAD_TAG_LEN) {
     ESP_LOGV(TAG, "drop encrypted packet: bad body length %zu", body_len);
+    this->verify_failed_++;
     return;
   }
   std::memcpy(work.data(), pkt.payload.data(), body_len);
@@ -69,8 +71,12 @@ void MulticastPubSub::handle_encrypted_(std::span<const uint8_t> raw, const Deco
   // AAD is the 12-byte cleartext header of the original datagram.
   if (!chacha20poly1305_decrypt(this->encryption_key_bytes_, nonce, raw.data(), HEADER_LEN, ct, ct_len, tag)) {
     ESP_LOGV(TAG, "drop encrypted packet: AEAD authentication failed");
+    this->verify_failed_++;
     return;
   }
+  // Authentication passed: this is a successful decryption regardless of
+  // whether the replay check below drops it or the topic is subscribed.
+  this->verify_ok_++;
   uint32_t crc = load_u32le(ct + 0);
   uint32_t ts = load_u32le(ct + 4);
   uint32_t rnonce = load_u32le(nonce);  // low 32 bits of the AEAD nonce
@@ -376,13 +382,21 @@ void MulticastPubSub::on_packet_(std::span<const uint8_t> raw) {
     this->handle_encrypted_(raw, pkt);
     return;
   }
-  this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false);
+  // Plaintext has no cipher to verify; the header topic-CRC is the only
+  // integrity-ish signal. A CRC that matches a subscription counts as a
+  // successful verify, one that matches nothing as a failed verify.
+  if (this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false))
+    this->verify_ok_++;
+  else
+    this->verify_failed_++;
 }
 
-void MulticastPubSub::deliver_(uint32_t crc, Encoding encoding, std::span<const uint8_t> payload, bool was_encrypted) {
+bool MulticastPubSub::deliver_(uint32_t crc, Encoding encoding, std::span<const uint8_t> payload, bool was_encrypted) {
+  bool crc_matched = false;
   for (auto &sub : this->subscriptions_) {
     if (sub.crc != crc)
       continue;
+    crc_matched = true;
     if (sub.require_encryption && !was_encrypted) {
       ESP_LOGV(TAG, "drop plaintext packet for encryption-required topic '%s'", sub.topic.c_str());
       continue;
@@ -409,6 +423,7 @@ void MulticastPubSub::deliver_(uint32_t crc, Encoding encoding, std::span<const 
       }
     }
   }
+  return crc_matched;
 }
 
 void MulticastPubSub::publish_metrics_() {
@@ -419,6 +434,14 @@ void MulticastPubSub::publish_metrics_() {
   if (this->packets_received_sensor_ != nullptr && this->packets_received_ != this->last_published_received_) {
     this->packets_received_sensor_->publish_state(static_cast<float>(this->packets_received_));
     this->last_published_received_ = this->packets_received_;
+  }
+  if (this->verify_ok_sensor_ != nullptr && this->verify_ok_ != this->last_published_verify_ok_) {
+    this->verify_ok_sensor_->publish_state(static_cast<float>(this->verify_ok_));
+    this->last_published_verify_ok_ = this->verify_ok_;
+  }
+  if (this->verify_failed_sensor_ != nullptr && this->verify_failed_ != this->last_published_verify_failed_) {
+    this->verify_failed_sensor_->publish_state(static_cast<float>(this->verify_failed_));
+    this->last_published_verify_failed_ = this->verify_failed_;
   }
 }
 
@@ -553,7 +576,13 @@ void MulticastPubSub::on_packet_(std::span<const uint8_t> raw) {
     this->handle_encrypted_(raw, pkt);
     return;
   }
-  this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false);
+  // Plaintext has no cipher to verify; the header topic-CRC is the only
+  // integrity-ish signal. A CRC that matches a subscription counts as a
+  // successful verify, one that matches nothing as a failed verify.
+  if (this->deliver_(pkt.topic_crc, pkt.encoding, pkt.payload, /*was_encrypted=*/false))
+    this->verify_ok_++;
+  else
+    this->verify_failed_++;
 }
 
 void MulticastPubSub::publish_metrics_() {
@@ -564,6 +593,14 @@ void MulticastPubSub::publish_metrics_() {
   if (this->packets_received_sensor_ != nullptr && this->packets_received_ != this->last_published_received_) {
     this->packets_received_sensor_->publish_state(static_cast<float>(this->packets_received_));
     this->last_published_received_ = this->packets_received_;
+  }
+  if (this->verify_ok_sensor_ != nullptr && this->verify_ok_ != this->last_published_verify_ok_) {
+    this->verify_ok_sensor_->publish_state(static_cast<float>(this->verify_ok_));
+    this->last_published_verify_ok_ = this->verify_ok_;
+  }
+  if (this->verify_failed_sensor_ != nullptr && this->verify_failed_ != this->last_published_verify_failed_) {
+    this->verify_failed_sensor_->publish_state(static_cast<float>(this->verify_failed_));
+    this->last_published_verify_failed_ = this->verify_failed_;
   }
 }
 
@@ -722,10 +759,12 @@ bool MulticastPubSub::publish_dynamic(const std::string &topic, uint16_t schema_
   return this->publish(topic, std::span<const uint8_t>(buf.data(), 2 + proto_bytes.size()), Encoding::PROTOBUF);
 }
 
-void MulticastPubSub::deliver_(uint32_t crc, Encoding encoding, std::span<const uint8_t> payload, bool was_encrypted) {
+bool MulticastPubSub::deliver_(uint32_t crc, Encoding encoding, std::span<const uint8_t> payload, bool was_encrypted) {
+  bool crc_matched = false;
   for (auto &sub : this->subscriptions_) {
     if (sub.crc != crc)
       continue;
+    crc_matched = true;
     if (sub.require_encryption && !was_encrypted) {
       ESP_LOGV(TAG, "drop plaintext packet for encryption-required topic '%s'", sub.topic.c_str());
       continue;
@@ -754,6 +793,7 @@ void MulticastPubSub::deliver_(uint32_t crc, Encoding encoding, std::span<const 
       }
     }
   }
+  return crc_matched;
 }
 
 void MulticastPubSub::cancel_indefinite_retransmit_(const std::string &topic) {
