@@ -1,0 +1,20 @@
+# Dev dependencies for the Home Assistant component tests (layer 3).
+#
+# Home Assistant now requires Python >= 3.14, and a distro Python is usually
+# externally managed (PEP 668), so install into a venv:
+#
+#   python3.14 -m venv .venv
+#   .venv/bin/pip install -r tests/ha/requirements.txt
+#   .venv/bin/python -m pytest tests/ha    # from the repo root, so
+#                                          # custom_components/ imports
+#
+# This layer is deliberately quarantined: layer 1 (`cd tests/unit && pytest`)
+# must keep running against nothing but the stdlib, so a stale pin here can
+# never take the wire tests down with it.
+#
+# pytest-homeassistant-custom-component pins an exact Home Assistant version
+# and releases roughly weekly, so this pin will go stale on its own schedule;
+# bump it when tests/ha starts failing without a repo change. It brings in
+# homeassistant, pytest-asyncio, pytest-socket, cryptography and the hass/
+# enable_custom_integrations fixtures.
+pytest-homeassistant-custom-component==0.13.346

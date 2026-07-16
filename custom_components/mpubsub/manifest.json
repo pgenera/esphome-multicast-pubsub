@@ -1,0 +1,13 @@
+{
+  "domain": "mpubsub",
+  "name": "mpubsub",
+  "codeowners": ["@pgenera"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/pgenera/esphome-mpubsub/blob/main/docs/HOMEASSISTANT.md",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/pgenera/esphome-mpubsub/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

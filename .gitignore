@@ -17,6 +17,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Home Assistant test venv (tests/ha/requirements.txt). Kept out of the system
+# Python, which is externally managed (PEP 668) and too new for HA anyway.
+.venv/
+
 # Cloned upstream esphome (used as read-only reference)
 esphome/
 
