@@ -1,9 +1,17 @@
-"""ChaCha20-Poly1305 AEAD payload encryption tests against the Python reference."""
+"""ChaCha20-Poly1305 AEAD payload encryption tests against the Python reference.
+
+Every test here runs **twice**: once against the pure-Python AEAD and once
+against the ``cryptography``-backed one (see the ``aead_backend`` fixture).
+"""
 
 from __future__ import annotations
 
+import os
+import random
+
 import pytest
 
+import reference
 from reference import (
     AEAD_NONCE_LEN,
     ENC_MODE_AEAD,
@@ -25,6 +33,73 @@ from reference import (
 
 # A fixed 12-byte nonce for deterministic encodings in tests.
 NONCE = bytes(range(12))
+
+# Grabbed independently of reference._FastAEAD so the equivalence test below
+# can reach the real class even while the fixture has blanked the dispatch.
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import (
+        ChaCha20Poly1305 as _REAL_FAST_AEAD,
+    )
+except ImportError:
+    _REAL_FAST_AEAD = None
+
+
+@pytest.fixture(autouse=True, params=["pure", "fast"])
+def aead_backend(request, monkeypatch):
+    """Run this whole module against both AEAD implementations.
+
+    ``reference.aead_encrypt`` / ``aead_decrypt`` dispatch on
+    ``reference._FastAEAD`` at call time. cryptography is usually installed,
+    so the fast path is what runs by default -- which means the pure path has
+    to be *forced* here, or it would silently stop being covered the moment
+    the accelerator landed. The pure leg always runs (the fallback must work
+    on a stdlib-only box); the fast leg skips when cryptography is absent.
+    """
+    if request.param == "pure":
+        monkeypatch.setattr(reference, "_FastAEAD", None)
+    elif reference._FastAEAD is None:
+        pytest.skip("cryptography not installed; no fast AEAD path to exercise")
+    return request.param
+
+
+# --- The two backends are one cipher -----------------------------------------
+
+
+def test_fast_and_pure_aead_agree_on_random_vectors() -> None:
+    """The accelerator is only safe if it is byte-identical to the spec.
+
+    Checks the pair directly rather than through the dispatch, so it holds
+    regardless of which leg of ``aead_backend`` is running.
+    """
+    if _REAL_FAST_AEAD is None:
+        pytest.skip("cryptography not installed")
+    rnd = random.Random(0xC0FFEE)  # deterministic: a failure is reproducible
+    for _ in range(100):
+        key = bytes(rnd.getrandbits(8) for _ in range(32))
+        nonce = bytes(rnd.getrandbits(8) for _ in range(12))
+        pt = os.urandom(rnd.randrange(0, 300))
+        aad = os.urandom(rnd.randrange(0, 40))
+
+        ct_py, tag_py = reference._aead_encrypt_py(key, nonce, pt, aad)
+        sealed = _REAL_FAST_AEAD(key).encrypt(nonce, pt, aad)
+        assert ct_py + tag_py == sealed, "fast AEAD disagrees with the reference"
+
+        # ...and each can open what the other sealed.
+        assert reference._aead_decrypt_py(key, nonce, sealed[:-16], sealed[-16:], aad) == pt
+        assert _REAL_FAST_AEAD(key).decrypt(nonce, ct_py + tag_py, aad) == pt
+
+
+def test_fast_path_raises_wire_error_on_bad_tag(monkeypatch) -> None:
+    """decode()'s contract is WireError, but cryptography raises InvalidTag.
+    The translation is easy to lose in a refactor, so pin it."""
+    if _REAL_FAST_AEAD is None:
+        pytest.skip("cryptography not installed")
+    monkeypatch.setattr(reference, "_FastAEAD", _REAL_FAST_AEAD)  # undo a "pure" leg
+    key = derive_key("k")
+    ct, tag = aead_encrypt(key, NONCE, b"hello", b"aad")
+    bad = bytes([tag[0] ^ 0x01]) + tag[1:]
+    with pytest.raises(WireError, match="authentication failed"):
+        aead_decrypt(key, NONCE, ct, bad, b"aad")
 
 
 # --- AEAD primitive (RFC 8439 known-answer vectors) --------------------------

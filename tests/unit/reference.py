@@ -2,11 +2,16 @@
 
 This is the source of truth that the C++ implementation in
 ``components/mpubsub/`` must match byte-for-byte. It is intentionally
-free of any ESPHome dependency so it can also be used by:
+free of any *required* third-party dependency so it can also be used by:
 
   * standalone bridges (e.g. an MQTT <-> multicast pub/sub gateway)
   * the wire-format unit tests (``tests/unit/test_wire_format.py``)
   * the probe / smoke-test tool (``tests/probe.py``)
+  * the Home Assistant component (``custom_components/mpubsub/``, which
+    vendors a byte-identical copy of this file)
+
+``cryptography``, if importable, is used to accelerate the AEAD; see
+:func:`aead_encrypt`. Everything still works without it.
 """
 
 from __future__ import annotations
@@ -20,6 +25,20 @@ import time
 import zlib
 from dataclasses import dataclass
 from typing import NamedTuple
+
+try:
+    # Optional accelerator. The pure-Python ChaCha20-Poly1305 below is a
+    # readable spec, not a fast one (~1 ms per 1220-byte packet), which
+    # matters when the caller decrypts on an event loop. When cryptography
+    # is importable we hand the AEAD to its C implementation instead; the
+    # two are asserted byte-identical by test_encryption.py.
+    from cryptography.exceptions import InvalidTag as _InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import (
+        ChaCha20Poly1305 as _FastAEAD,
+    )
+except ImportError:  # pragma: no cover - exercised by forcing the pure path
+    _FastAEAD = None
+    _InvalidTag = None
 
 MAGIC = b"MP"
 VERSION = 0x01
@@ -148,17 +167,14 @@ def _poly1305_key(key: bytes, nonce: bytes) -> bytes:
     return _chacha_block(key, 0, nonce)[:32]
 
 
-def aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes]:
-    """ChaCha20-Poly1305 encrypt (RFC 8439 §2.8). Returns ``(ciphertext, tag)``."""
+def _aead_encrypt_py(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes]:
     otk = _poly1305_key(key, nonce)
     ct = chacha20(key, 1, nonce, plaintext)
     mac_data = aad + _pad16(aad) + ct + _pad16(ct) + struct.pack("<QQ", len(aad), len(ct))
     return ct, _poly1305(otk, mac_data)
 
 
-def aead_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: bytes) -> bytes:
-    """ChaCha20-Poly1305 decrypt + verify. Raises :class:`WireError` if the
-    tag doesn't authenticate (wrong key, tampering, or truncation)."""
+def _aead_decrypt_py(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: bytes) -> bytes:
     otk = _poly1305_key(key, nonce)
     mac_data = aad + _pad16(aad) + ciphertext + _pad16(ciphertext) + struct.pack("<QQ", len(aad), len(ciphertext))
     expected = _poly1305(otk, mac_data)
@@ -167,6 +183,35 @@ def aead_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: b
     if not _ct_eq(expected, tag):
         raise WireError("AEAD authentication failed (wrong key or tampered packet)")
     return chacha20(key, 1, nonce, ciphertext)
+
+
+# The two public AEAD entry points dispatch on ``_FastAEAD`` at *call* time,
+# not import time, so a test can force the pure path with
+# ``monkeypatch.setattr(reference, "_FastAEAD", None)``. Both paths are
+# RFC 8439 §2.8 and produce identical bytes -- test_encryption.py runs the
+# whole encryption suite twice to keep that true.
+
+
+def aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes]:
+    """ChaCha20-Poly1305 encrypt (RFC 8439 §2.8). Returns ``(ciphertext, tag)``."""
+    if _FastAEAD is None:
+        return _aead_encrypt_py(key, nonce, plaintext, aad)
+    # cryptography returns ciphertext||tag; the wire format keeps them apart.
+    sealed = _FastAEAD(key).encrypt(nonce, plaintext, aad)
+    return sealed[:-AEAD_TAG_LEN], sealed[-AEAD_TAG_LEN:]
+
+
+def aead_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: bytes) -> bytes:
+    """ChaCha20-Poly1305 decrypt + verify. Raises :class:`WireError` if the
+    tag doesn't authenticate (wrong key, tampering, or truncation)."""
+    if _FastAEAD is None:
+        return _aead_decrypt_py(key, nonce, ciphertext, tag, aad)
+    try:
+        return _FastAEAD(key).decrypt(nonce, ciphertext + tag, aad)
+    except _InvalidTag as err:
+        # decode() promises WireError for an unauthentic packet; keep the
+        # message identical to the pure path's.
+        raise WireError("AEAD authentication failed (wrong key or tampered packet)") from err
 
 
 def _ct_eq(a: bytes, b: bytes) -> bool:
