@@ -26,6 +26,15 @@ Two big "modes" — pick whichever fits the data:
   builder. Best for structured records (climate readings, doorbell
   events, anything with named fields).
 
+Beyond ESPHome devices, two things can join a fabric:
+
+* **Home Assistant, natively** — [`custom_components/mpubsub/`](custom_components/mpubsub/)
+  is an integration that joins the multicast groups itself, with an API
+  mirroring HA's built-in `mqtt`. No broker, no bridge. See
+  [`docs/HOMEASSISTANT.md`](docs/HOMEASSISTANT.md).
+* **An MQTT broker** — [`bridges/mqtt-go/`](bridges/mqtt-go/) relays both
+  ways. Use this when you want a broker, MQTT wildcards, or discovery.
+
 ### Raw publish/subscribe (YAML)
 
 ```yaml
@@ -161,9 +170,13 @@ esphome compile tests/subscriber.yaml
 
 # end-to-end smoke (two terminals)
 ./tests/run_e2e.sh
+
+# Home Assistant component (needs a venv; see docs/TESTING.md)
+.venv/bin/python -m pytest tests/ha
 ```
 
-See `tests/README.md` for the full test catalog.
+See `tests/README.md` for the full test catalog and
+[`docs/TESTING.md`](docs/TESTING.md) for the three layers.
 
 ## License
 
@@ -197,3 +210,9 @@ bottom of [`LICENSE`](LICENSE).
 * No MQTT-style wildcards (`+`, `#`) — each subscription is one exact topic.
   A separate bridge can fan out wildcards from MQTT.
 * No retain / last-will semantics; multicast UDP is fire-and-forget.
+* The Home Assistant integration inherits every limitation above, and they
+  are more visible there because MQTT sets a different expectation: entities
+  start `unknown` (nothing retains a last value), wildcards are rejected
+  outright, and there is no discovery. See the caveat table in
+  [`docs/HOMEASSISTANT.md`](docs/HOMEASSISTANT.md). It is also RAW-only for
+  now — typed messages are ESPHome-to-ESPHome.
