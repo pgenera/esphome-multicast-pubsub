@@ -25,7 +25,6 @@ from homeassistant.core import callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.template import Template
 
 from . import async_subscribe
 from .const import (
@@ -42,7 +41,7 @@ from .const import (
     DOMAIN,
 )
 from .models import ReceiveMessage
-from .util import valid_topic
+from .util import valid_encoding, valid_topic
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,7 +70,7 @@ MPUBSUB_ENTITY_COMMON_SCHEMA = vol.Schema(
         vol.Optional(CONF_QOS, default=DEFAULT_QOS): vol.All(
             vol.Coerce(int), vol.In([0, 1, 2])
         ),
-        vol.Optional(CONF_ENCODING, default=DEFAULT_ENCODING): vol.Any(cv.string, None),
+        vol.Optional(CONF_ENCODING, default=DEFAULT_ENCODING): valid_encoding,
         vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
         vol.Optional(CONF_AVAILABILITY_TOPIC): valid_topic,
         vol.Optional(CONF_AVAILABILITY_TEMPLATE): cv.template,

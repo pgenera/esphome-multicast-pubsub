@@ -17,6 +17,7 @@ free of any *required* third-party dependency so it can also be used by:
 from __future__ import annotations
 
 import collections
+import functools
 import hashlib
 import ipaddress
 import os
@@ -192,12 +193,25 @@ def _aead_decrypt_py(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aa
 # whole encryption suite twice to keep that true.
 
 
+@functools.lru_cache(maxsize=8)
+def _fast_cipher(key: bytes):
+    """One cipher object per key, rather than one per packet.
+
+    Building a ChaCha20Poly1305 re-validates the key and allocates; at a
+    packet a second per device that is pure garbage on the caller's event
+    loop. A fabric has one key (a handful if you count a bridge mid-rotation),
+    so a tiny cache covers it. Keys are already long-lived in the caller's
+    config, so holding them here costs nothing new.
+    """
+    return _FastAEAD(key)
+
+
 def aead_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple[bytes, bytes]:
     """ChaCha20-Poly1305 encrypt (RFC 8439 §2.8). Returns ``(ciphertext, tag)``."""
     if _FastAEAD is None:
         return _aead_encrypt_py(key, nonce, plaintext, aad)
     # cryptography returns ciphertext||tag; the wire format keeps them apart.
-    sealed = _FastAEAD(key).encrypt(nonce, plaintext, aad)
+    sealed = _fast_cipher(key).encrypt(nonce, plaintext, aad)
     return sealed[:-AEAD_TAG_LEN], sealed[-AEAD_TAG_LEN:]
 
 
@@ -207,7 +221,7 @@ def aead_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: b
     if _FastAEAD is None:
         return _aead_decrypt_py(key, nonce, ciphertext, tag, aad)
     try:
-        return _FastAEAD(key).decrypt(nonce, ciphertext + tag, aad)
+        return _fast_cipher(key).decrypt(nonce, ciphertext + tag, aad)
     except _InvalidTag as err:
         # decode() promises WireError for an unauthentic packet; keep the
         # message identical to the pure path's.

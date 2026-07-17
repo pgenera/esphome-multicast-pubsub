@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING, Any
 from .reference import ENCODING_RAW
 
 if TYPE_CHECKING:
-    from homeassistant.core import HomeAssistant
-
     from .client import MpubsubClient
 
 PublishPayloadType = str | bytes | int | float | None
@@ -86,6 +84,3 @@ class MpubsubConfig:
     retransmit_delay: float
     promote_qos: bool
     replay_window: int
-
-
-ClientFactory = Callable[["HomeAssistant", MpubsubConfig], "MpubsubClient"]

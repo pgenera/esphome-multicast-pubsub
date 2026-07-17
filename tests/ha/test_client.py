@@ -13,7 +13,6 @@ make this suite lie -- an orphan holding :18512 has burned this repo before.
 from __future__ import annotations
 
 import asyncio
-import socket
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -483,3 +482,65 @@ async def test_qos0_with_promote_emits_one(hass: HomeAssistant, client) -> None:
         sniffer.close()
 
     assert len(packets) == 1
+
+
+async def test_unsubscribing_from_inside_a_callback_is_safe(
+    hass: HomeAssistant, client
+) -> None:
+    """A @callback subscriber runs synchronously during dispatch and may
+    unsubscribe itself, mutating the very lists being iterated."""
+    cli = await client()
+    got: list = []
+
+    def once(msg):
+        got.append(msg)
+        unsub()  # removes the last listener -> leaves the group mid-dispatch
+
+    unsub = await cli.async_subscribe(TOPIC, once)
+
+    send_raw(TOPIC, b"first", cli.config.port)
+    await wait_for(got)
+    send_raw(TOPIC, b"second", cli.config.port)
+    await asyncio.sleep(0.2)
+
+    assert len(got) == 1, "the callback unsubscribed itself; it must not fire again"
+    assert TOPIC not in cli._subs
+
+
+async def test_crc_collision_dispatch_survives_unsubscribe(
+    hass: HomeAssistant, client
+) -> None:
+    """Two topics sharing a TOPIC_CRC32 land in one _crc_index list.
+
+    The wire carries only the CRC, so both subscriptions receive each other's
+    messages -- the client warns at subscribe time and cannot do better. What
+    it must not do is *skip* a delivery because the first subscriber
+    unsubscribed while the second was still pending: the outer loop iterates
+    that shared list, so mutating it mid-dispatch drops the second.
+
+    The collision is forced rather than found -- grinding 2**32 hashes to get
+    a real one would prove nothing extra, since the dispatch path only ever
+    sees the CRC.
+    """
+    cli = await client()
+    b_got: list = []
+
+    def a_cb(_msg):
+        unsub_a()  # last listener for collide/a -> mutates the shared list
+
+    unsub_a = await cli.async_subscribe("collide/a", a_cb)
+    await cli.async_subscribe("collide/b", b_got.append)
+
+    a_sub = cli._subs["collide/a"]
+    b_sub = cli._subs["collide/b"]
+    cli._crc_index.pop(b_sub.crc, None)
+    b_sub.crc = a_sub.crc
+    cli._crc_index[a_sub.crc] = [a_sub, b_sub]
+
+    send_raw("collide/a", b"x", cli.config.port)
+    await wait_for(b_got)
+
+    assert len(b_got) == 1, (
+        "the colliding subscription was skipped because the other "
+        "unsubscribed mid-iteration"
+    )

@@ -22,7 +22,7 @@ from datetime import timedelta
 
 from custom_components.mpubsub.const import DATA_MPUBSUB
 from custom_components.mpubsub.reference import decode
-from helpers import Sniffer, requires_multicast, send_raw, wait_for
+from helpers import Sniffer, requires_multicast, send_raw
 
 pytestmark = requires_multicast
 

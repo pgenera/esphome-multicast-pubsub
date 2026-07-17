@@ -20,7 +20,7 @@ from custom_components.mpubsub import (
 )
 from custom_components.mpubsub.models import ReceiveMessage
 from custom_components.mpubsub.util import TopicError, validate_topic
-from helpers import Sniffer, requires_multicast, send_raw, wait_for
+from helpers import requires_multicast, send_raw, wait_for
 
 pytestmark = requires_multicast
 

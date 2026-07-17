@@ -21,7 +21,7 @@ from custom_components.mpubsub.const import (
     EVENT_MESSAGE_RECEIVED,
 )
 from custom_components.mpubsub.reference import decode, derive_key
-from helpers import Sniffer, requires_multicast, send_raw, wait_for
+from helpers import Sniffer, requires_multicast, send_raw
 
 pytestmark = requires_multicast
 

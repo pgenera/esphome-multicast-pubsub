@@ -129,9 +129,11 @@ class MpubsubClient:
     def _make_socket(self) -> socket.socket:
         """Build the multicast socket. Runs in the executor.
 
-        Nothing here truly blocks, but socket()/bind()/setsockopt trip Home
-        Assistant's blocking-call detector, and if_nametoindex on a bad name
-        raises -- both are better off the loop.
+        Not because it must: Home Assistant's blocking-call detector covers
+        open/glob/import/sleep and friends, not socket calls, and none of
+        these block in any real sense. It is here because async_start awaits
+        it during setup, where an executor hop is free, and it keeps
+        if_nametoindex and a bind on a contended port off the loop.
 
         The recipe is tests/probe.py's verified one plus the send-side
         options from bridges/mqtt-go/mcast.go.
@@ -241,7 +243,7 @@ class MpubsubClient:
 
         if self._sock is None:
             raise RuntimeError("mpubsub client is not started")
-        await self.hass.async_add_executor_job(self._join_group, group)
+        self._join_group(group)
 
         topic_sub = _TopicSub(topic=topic, crc=crc, group=group)
         self._subs[topic] = topic_sub
@@ -249,18 +251,26 @@ class MpubsubClient:
         _LOGGER.debug("joined %s for topic %r (crc %#010x)", group, topic, crc)
         return topic_sub
 
+    # Group join/leave run inline, not in the executor. setsockopt on an
+    # already-open fd is a bare syscall -- it does no I/O and Home Assistant's
+    # blocking-call detector doesn't cover it (only open/glob/import/sleep and
+    # friends). Pushing them to the executor bought nothing and cost
+    # correctness: _unsubscribe had to fire the job without awaiting it, so a
+    # late unsubscribe -- one arriving as the loop shuts down -- raised
+    # "RuntimeError: no running event loop" out of async_add_executor_job.
+    # Socket *creation* stays in the executor; that one is awaited.
+
     def _join_group(self, group: IPv6Address) -> None:
         assert self._sock is not None
         mreq = group.packed + struct.pack("@I", self._ifindex)
         self._sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
 
-    def _leave_group(self, sock: socket.socket, group: IPv6Address) -> None:
-        # The socket is passed in, not read from self: _unsubscribe schedules
-        # this without awaiting it, so async_stop can have cleared self._sock
-        # (and closed it) by the time this runs in a worker thread.
+    def _leave_group(self, group: IPv6Address) -> None:
+        if self._sock is None:
+            return  # already stopped; the close left every group for us
         mreq = group.packed + struct.pack("@I", self._ifindex)
         try:
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_LEAVE_GROUP, mreq)
+            self._sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_LEAVE_GROUP, mreq)
         except OSError as err:  # pragma: no cover - already gone is fine
             _LOGGER.debug("leaving %s failed: %s", group, err)
 
@@ -279,10 +289,7 @@ class MpubsubClient:
             siblings.remove(topic_sub)
         if not siblings:
             self._crc_index.pop(topic_sub.crc, None)
-        if self._sock is not None:
-            self.hass.async_add_executor_job(
-                self._leave_group, self._sock, topic_sub.group
-            )
+        self._leave_group(topic_sub.group)
         _LOGGER.debug("left %s (no subscribers for %r)", topic_sub.group, topic)
 
     # --- receive -------------------------------------------------------------
@@ -332,7 +339,12 @@ class MpubsubClient:
             return
 
         timestamp = time.time()
-        for topic_sub in subs:
+        # Both lists are copied: a @callback subscriber runs synchronously
+        # inside async_run_hass_job and may unsubscribe itself, which removes
+        # entries from topic_sub.callbacks *and*, if it was the last listener,
+        # from this very `subs` list (see _unsubscribe). Iterating either one
+        # live would silently skip a delivery.
+        for topic_sub in list(subs):
             for sub in list(topic_sub.callbacks):
                 self._dispatch(topic_sub, sub, msg, timestamp)
 
@@ -355,6 +367,20 @@ class MpubsubClient:
                     topic_sub.topic,
                     sub.encoding,
                     sub.job,
+                )
+                return
+            except LookupError:
+                # An unknown codec raises LookupError, which is NOT a
+                # UnicodeDecodeError. Unhandled, it escapes into
+                # datagram_received once per arriving packet -- forever. The
+                # schemas screen this out (util.valid_encoding); this covers
+                # async_subscribe's Python callers, who reach it directly.
+                _LOGGER.error(
+                    "Unknown encoding %r for subscription on %s; dropping the "
+                    "message. Use a Python codec name such as 'utf-8', or None "
+                    "for raw bytes.",
+                    sub.encoding,
+                    topic_sub.topic,
                 )
                 return
         self.hass.async_run_hass_job(

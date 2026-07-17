@@ -322,3 +322,27 @@ def test_plaintext_has_no_replay_fields() -> None:
     assert msg.timestamp is None
     assert msg.nonce is None
     assert not msg.was_encrypted
+
+
+def test_fast_cipher_is_reused_per_key(aead_backend) -> None:
+    """One cipher object per key, not per packet.
+
+    Building a ChaCha20Poly1305 re-validates the key and allocates; at a
+    packet a second per device that is pure garbage on the caller's event
+    loop. Correctness is covered by the equivalence test above -- this pins
+    the reuse so a refactor can't quietly reintroduce the per-call
+    construction.
+    """
+    if reference._FastAEAD is None:
+        pytest.skip("cryptography not installed; no cipher to cache")
+    reference._fast_cipher.cache_clear()
+    key = derive_key("cache-me")
+    for _ in range(5):
+        aead_encrypt(key, NONCE, b"x", b"aad")
+    info = reference._fast_cipher.cache_info()
+    assert info.misses == 1, "the cipher should be built once"
+    assert info.hits == 4
+
+    # A different key gets its own object rather than evicting on every call.
+    aead_encrypt(derive_key("other"), NONCE, b"x", b"aad")
+    assert reference._fast_cipher.cache_info().misses == 2

@@ -27,6 +27,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import (
     CALLBACK_TYPE,
+    Event,
     HomeAssistant,
     ServiceCall,
     ServiceResponse,
@@ -78,7 +79,7 @@ from .models import (
     ReceiveMessage,
 )
 from .reference import derive_key
-from .util import TopicError, valid_topic, validate_topic
+from .util import TopicError, valid_encoding, valid_topic
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,7 +121,7 @@ SERVICE_LISTEN_SCHEMA = vol.Schema(
         vol.Optional(CONF_DURATION, default=DEFAULT_LISTEN_DURATION): vol.All(
             vol.Coerce(float), vol.Range(min=0.1, max=300)
         ),
-        vol.Optional(CONF_ENCODING, default=DEFAULT_ENCODING): vol.Any(cv.string, None),
+        vol.Optional(CONF_ENCODING, default=DEFAULT_ENCODING): valid_encoding,
     }
 )
 
@@ -174,10 +175,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _async_register_services(hass)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+
+    async def _stop(_event: Event) -> None:
+        await client.async_stop()
+
+    # Must be a coroutine *function*: Home Assistant decides whether to await
+    # a listener by inspecting the callable, so `lambda e: client.async_stop()`
+    # would hand it a plain function, get a coroutine back, and drop it
+    # unawaited -- leaving the socket open for the life of the process.
     entry.async_on_unload(
-        hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STOP, lambda _event: client.async_stop()
-        )
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _stop)
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, _platforms(yaml_config))
@@ -275,7 +282,16 @@ def _encode_payload(payload: PublishPayloadType, encoding: str | None) -> bytes:
         return payload
     if not isinstance(payload, str):
         payload = str(payload)
-    return payload.encode(encoding or DEFAULT_ENCODING)
+    try:
+        return payload.encode(encoding or DEFAULT_ENCODING)
+    except LookupError as err:
+        # An unknown codec raises LookupError, not UnicodeEncodeError. The
+        # schemas screen this out (util.valid_encoding), but async_publish is
+        # public API and a Python caller reaches it directly.
+        raise ValueError(
+            f"unknown text encoding {encoding!r}: {err}. Use a Python codec "
+            f"name such as 'utf-8', or None to publish bytes unchanged."
+        ) from err
 
 
 async def async_subscribe(

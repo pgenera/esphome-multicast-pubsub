@@ -20,7 +20,7 @@
       }
     },
     "error": {
-      "cannot_connect": "Could not open the multicast socket. Check that the port is free and that this host has IPv6 enabled.",
+      "cannot_connect": "Could not open the multicast socket: {error}. Check that the port is free and that this host has IPv6 enabled.",
       "unknown_interface": "No such network interface on this host."
     },
     "abort": {

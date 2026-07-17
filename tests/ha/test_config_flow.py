@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
 import voluptuous as vol
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.core import HomeAssistant
@@ -327,3 +326,43 @@ def test_translations_match_strings() -> None:
     assert json.loads((component / "strings.json").read_text()) == json.loads(
         (component / "translations" / "en.json").read_text()
     ), "translations/en.json is a copy of strings.json; re-copy it"
+
+
+async def test_bind_failure_reason_reaches_the_user_and_the_log(
+    hass: HomeAssistant, caplog
+) -> None:
+    """"Port in use" and "IPv6 unavailable" need different fixes, so the
+    errno cannot be swallowed.
+
+    It previously went into self.context["error_detail"], which nothing read,
+    in a module with no logger -- so the reason was destroyed outright and
+    the user got a generic string.
+    """
+    with patch(
+        "custom_components.mpubsub.config_flow._probe_socket",
+        side_effect=OSError(98, "Address already in use"),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"port": 18512, "scope": "link-local", "interface": "", "encryption_key": ""},
+        )
+
+    assert result["errors"] == {"base": "cannot_connect"}
+    # Shown on the form...
+    assert "Address already in use" in result["description_placeholders"]["error"]
+    # ...and in the log, which is what a user can actually paste into an issue.
+    assert "Address already in use" in caplog.text
+
+
+def test_cannot_connect_string_renders_the_placeholder() -> None:
+    """A placeholder the string doesn't reference is silently dropped."""
+    import json
+
+    strings = json.loads((_component_dir() / "strings.json").read_text())
+    assert "{error}" in strings["config"]["error"]["cannot_connect"], (
+        "config_flow passes description_placeholders['error']; the string has "
+        "to reference it or the reason is dropped on the floor"
+    )

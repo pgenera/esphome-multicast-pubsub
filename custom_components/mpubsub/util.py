@@ -1,11 +1,14 @@
-"""Topic validation -- the one place a topic string is judged.
+"""Validation for the things a user can type: topics and text codecs.
 
-Ported from ``components/mpubsub/__init__.py`` ``_topic_validator`` so the
-ESPHome side and this one accept and reject exactly the same strings, with
-one deliberate addition: wildcards. See :func:`validate_topic`.
+The topic rules are ported from ``components/mpubsub/__init__.py``
+``_topic_validator`` so the ESPHome side and this one accept and reject
+exactly the same strings, with one deliberate addition: wildcards. See
+:func:`validate_topic`.
 """
 
 from __future__ import annotations
+
+import codecs
 
 import voluptuous as vol
 
@@ -65,3 +68,28 @@ def valid_topic(value: str) -> str:
         return validate_topic(value)
     except TopicError as err:
         raise vol.Invalid(str(err)) from err
+
+
+def valid_encoding(value: str | None) -> str | None:
+    """Validate a text codec name at config time.
+
+    ``encoding`` reaches ``bytes.decode()`` on the receive path, where an
+    unknown codec raises LookupError -- not UnicodeDecodeError -- once per
+    arriving packet, forever. Catching that at the schema turns a typo into
+    one error on the config you just wrote, rather than a stream of
+    exceptions on the event loop with no obvious cause.
+
+    ``None`` is valid and means "don't decode; give me bytes".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise vol.Invalid(f"encoding must be a string, got {type(value).__name__}")
+    try:
+        codecs.lookup(value)
+    except LookupError as err:
+        raise vol.Invalid(
+            f"unknown text encoding {value!r}: {err}. Use a Python codec name "
+            f"such as 'utf-8', or leave it unset for raw bytes."
+        ) from err
+    return value

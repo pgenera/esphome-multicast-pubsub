@@ -7,6 +7,7 @@ rules, so a fabric that is legal in one place is legal in all of them.
 
 from __future__ import annotations
 
+import logging
 import socket
 from typing import Any
 
@@ -52,6 +53,8 @@ from .const import (
     RETRANSMIT_INDEFINITE,
     SCOPES,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 USER_SCHEMA = vol.Schema(
     {
@@ -167,6 +170,7 @@ class MpubsubConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="single_instance_allowed")
 
         errors: dict[str, str] = {}
+        placeholders: dict[str, str] = {}
         if user_input is not None:
             port = int(user_input[CONF_PORT])
             interface = (user_input.get(CONF_INTERFACE) or "").strip()
@@ -176,8 +180,17 @@ class MpubsubConfigFlow(ConfigFlow, domain=DOMAIN):
                 if interface and err.errno in (None, 19):  # ENODEV
                     errors[CONF_INTERFACE] = "unknown_interface"
                 else:
+                    # "port in use" and "IPv6 unavailable" need different
+                    # fixes, so the reason has to reach the user. Log it too:
+                    # a form error is easy to miss and impossible to paste.
+                    _LOGGER.error(
+                        "mpubsub cannot open port %s (interface=%s): %s",
+                        port,
+                        interface or "<kernel-picked>",
+                        err,
+                    )
                     errors["base"] = "cannot_connect"
-                    self.context["error_detail"] = str(err)
+                    placeholders["error"] = str(err)
             if not errors:
                 return self.async_create_entry(
                     title="mpubsub",
@@ -190,7 +203,10 @@ class MpubsubConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         return self.async_show_form(
-            step_id="user", data_schema=USER_SCHEMA, errors=errors
+            step_id="user",
+            data_schema=USER_SCHEMA,
+            errors=errors,
+            description_placeholders=placeholders,
         )
 
     @staticmethod
