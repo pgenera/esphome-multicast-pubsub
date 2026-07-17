@@ -1,0 +1,47 @@
+publish:
+  fields:
+    topic:
+      required: true
+      example: home/kitchen/temp
+      selector:
+        text:
+    payload:
+      example: "21.5"
+      selector:
+        text:
+    evaluate_payload:
+      default: false
+      selector:
+        boolean:
+    qos:
+      default: 0
+      selector:
+        select:
+          options:
+            - "0"
+            - "1"
+            - "2"
+    retain:
+      default: false
+      selector:
+        boolean:
+
+listen:
+  fields:
+    topic:
+      required: true
+      example: home/kitchen/temp
+      selector:
+        text:
+    duration:
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 300
+          unit_of_measurement: seconds
+    encoding:
+      default: "utf-8"
+      example: "utf-8"
+      selector:
+        text:

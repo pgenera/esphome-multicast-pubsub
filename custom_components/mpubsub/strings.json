@@ -1,0 +1,102 @@
+{
+  "title": "mpubsub",
+  "config": {
+    "step": {
+      "user": {
+        "title": "mpubsub",
+        "description": "Brokerless IPv6-multicast pub/sub. Home Assistant must be able to send and receive IPv6 multicast on the same network segment as your devices — a container on the default bridge network cannot, and will silently receive nothing.",
+        "data": {
+          "port": "Port",
+          "scope": "Multicast scope",
+          "interface": "Network interface",
+          "encryption_key": "Encryption passphrase"
+        },
+        "data_description": {
+          "port": "Must match the `port:` on your devices.",
+          "scope": "Must match the `scope:` on your devices. A different scope is a different multicast group, so a mismatch means silence rather than an error.",
+          "interface": "Leave blank to let the kernel choose. Required in practice on a host with more than one network interface, since only one link is joined.",
+          "encryption_key": "The same passphrase as your devices' `encryption: key:`. Leave blank for plaintext."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not open the multicast socket. Check that the port is free and that this host has IPv6 enabled.",
+      "unknown_interface": "No such network interface on this host."
+    },
+    "abort": {
+      "single_instance_allowed": "mpubsub is already configured."
+    }
+  },
+  "options": {
+    "error": {
+      "replay_window_needs_key": "A replay window needs an encryption passphrase: replay protection only ever applies to encrypted packets.",
+      "indefinite_needs_delay": "An indefinite retransmit count (-1) needs a retransmit delay of at least 1 second, or it will saturate the network.",
+      "invalid_retransmit_count": "Retransmit count must be 1 to 255, or -1 for indefinite. Every publish sends at least one datagram, so 0 is meaningless."
+    },
+    "step": {
+      "init": {
+        "title": "mpubsub options",
+        "data": {
+          "hops": "Hop limit",
+          "retransmit_count": "Retransmit count",
+          "retransmit_delay": "Retransmit delay",
+          "promote_qos": "Promote QoS to retransmits",
+          "replay_window": "Replay window"
+        },
+        "data_description": {
+          "hops": "IPv6 multicast hop limit. 1 keeps traffic on the local segment.",
+          "retransmit_count": "Datagrams sent per publish. 1 disables retransmission; -1 keeps resending until another publish to the same topic supersedes it. Without encryption and a replay window, each retransmit is delivered again.",
+          "retransmit_delay": "Seconds between retransmissions.",
+          "promote_qos": "Map the qos argument of mpubsub.publish onto the retransmit count: 0 leaves it alone, 1 raises it to at least 3, 2 resends until superseded. Never a delivery guarantee — nothing acknowledges anything.",
+          "replay_window": "Seconds of clock skew to accept on encrypted packets, and how long to remember nonces for de-duplication. 0 disables replay protection. Only ever applies to encrypted traffic."
+        }
+      }
+    }
+  },
+  "services": {
+    "publish": {
+      "name": "Publish",
+      "description": "Publishes a message to an mpubsub topic.",
+      "fields": {
+        "topic": {
+          "name": "Topic",
+          "description": "Topic to publish to. Wildcards (+ and #) are not supported."
+        },
+        "payload": {
+          "name": "Payload",
+          "description": "Payload to publish. Up to ~1220 bytes, less when encrypted."
+        },
+        "evaluate_payload": {
+          "name": "Evaluate payload",
+          "description": "Evaluate the payload as a Python literal, so a bytes literal such as b'\\x01' can be sent."
+        },
+        "qos": {
+          "name": "QoS",
+          "description": "Only has an effect when the Promote QoS option is on, where it raises the retransmit count. Not a delivery guarantee."
+        },
+        "retain": {
+          "name": "Retain",
+          "description": "Accepted for compatibility with MQTT-shaped code and ignored: mpubsub has no retain flag and no broker to store messages."
+        }
+      }
+    },
+    "listen": {
+      "name": "Listen",
+      "description": "Subscribes to a topic for a while and reports what arrives. The replacement for the MQTT panel's 'Listen to a topic'. Messages are returned in the response and fired on the event bus as mpubsub_message_received, watchable in Developer Tools > Events.",
+      "fields": {
+        "topic": {
+          "name": "Topic",
+          "description": "Exact topic to listen to. Wildcards are not supported, so there is no way to dump all traffic."
+        },
+        "duration": {
+          "name": "Duration",
+          "description": "How many seconds to listen before unsubscribing."
+        },
+        "encoding": {
+          "name": "Encoding",
+          "description": "Text codec used to decode payloads. Leave blank to report raw bytes as hex."
+        }
+      }
+    }
+  }
+}
