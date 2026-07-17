@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpubsub"
+version = "0.1.0"
+description = "Brokerless IPv6-multicast publish/subscribe (mpubsub) client and wire format"
+readme = "README.md"
+# Runs anywhere 3.7 does. The wire format is stdlib-only and has no 3.8+
+# runtime syntax, so it drops into old deployments (e.g. SenseLink's
+# python:3.7 image) without dragging in dependencies.
+requires-python = ">=3.7"
+license = { text = "MIT" }
+authors = [{ name = "Phil Genera" }]
+keywords = ["multicast", "pubsub", "iot", "esphome", "ipv6"]
+dependencies = []
+
+[project.optional-dependencies]
+# The pure-Python ChaCha20-Poly1305 is a readable spec, not a fast one
+# (~4 ms per max-size packet). Install this extra to hand the AEAD to a
+# C implementation (~550x faster) when decrypting on an event loop.
+crypto = ["cryptography>=3.0"]
+
+[project.urls]
+Homepage = "https://github.com/pgenera/esphome-mpubsub"
+Source = "https://github.com/pgenera/esphome-mpubsub/tree/main/python"
+
+[tool.setuptools]
+packages = ["mpubsub"]

@@ -34,3 +34,8 @@ tests/unit/topic_hash_test_san
 tests/unit/wire_format_test_san
 tests/unit/replay_guard_test_san
 tests/unit/chacha_test_san
+
+# Library test venv (python/.venv-test)
+python/.venv-test/
+python/*.egg-info/
+python/build/
